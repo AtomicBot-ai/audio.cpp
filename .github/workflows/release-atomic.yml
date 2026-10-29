@@ -1,0 +1,1042 @@
+name: Release (Atomic)
+run-name: "Release (Atomic) ${{ inputs.upstream_tag }} [cid:${{ inputs.candidate_id }}]"
+
+# Builds every audio.cpp engine Atomic Chat ships, from an unmodified upstream tag plus the patch
+# series in atomic/patches, and publishes them as one release of that tag here:
+#
+#   macos-arm64        universal (arm64 + x86_64), Metal
+#   win-cpu-x64  win-vulkan-x64  win-cuda12-x64 (+ the cudart-win-cu12-x64 companion)  win-cuda13-x64
+#   linux-cpu-x64  linux-vulkan-x64
+#   linux-cpu-arm64  linux-cuda13-arm64 (DGX Spark / GB10)  win-cpu-arm64  win-cuda13-arm64 (N1X)
+#
+# Assets are audio-<tag>-bin-<backend id>.zip, audio-<tag>-cudart-win-cu12-x64.zip and SHA256SUMS:
+# flat archives with audiocpp_server and audiocpp_cli next to every runtime library they need and the
+# compiled model specs inside the binaries (AUDIOCPP_DEPLOYMENT_BUILD). No eSpeak-ng by default: it
+# is GPL-3.0-or-later and the archives stay Apache-2.0, so Kokoro, Piper, SanoTTS and Inflect cannot
+# speak; static_espeak links it in and ships its data and licenses. atomic-chat-conf's
+# mirror-audiocpp.yml mirrors and signs them. `targets` rebuilds a subset while fixing one; a release
+# needs `all`. See atomic/README.md.
+#
+# The hatchet pipeline (AtomicBot-ai/atomic-hatchet-pipeline) is to dispatch this the way it does
+# for stable-diffusion.cpp: on upstream-sync/<tag> with publish and replace, finding the run by
+# [cid:...] in its title, and telling a patch conflict from a broken build by which job failed: the
+# one named `patches` or another.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "0xShug0/audio.cpp release tag to build (vX.Y.Z, e.g. v0.9.3)"
+        required: true
+        type: string
+      targets:
+        description: "Backend ids to build, comma-separated, or 'all' (publishing needs all)"
+        required: false
+        default: all
+        type: string
+      publish:
+        description: "Create the release of that tag in this repository"
+        required: false
+        default: false
+        type: boolean
+      replace:
+        description: "Replace that release's archives if it already exists; without it publishing fails"
+        required: false
+        default: false
+        type: boolean
+      static_espeak:
+        description: "Link eSpeak-ng (GPL-3.0-or-later) statically for Kokoro, Piper, SanoTTS, Inflect; off keeps the archives Apache-2.0"
+        required: false
+        default: false
+        type: boolean
+      candidate_id:
+        description: "Id the caller finds this run by in its title"
+        required: false
+        default: manual
+        type: string
+
+concurrency:
+  group: release-atomic-${{ inputs.upstream_tag }}-${{ inputs.targets }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: 0xShug0/audio.cpp
+  TAG: ${{ inputs.upstream_tag }}
+  STATIC_ESPEAK: ${{ inputs.static_espeak && 'ON' || 'OFF' }}
+  # The empty string must be the last operand: `cond && '' || x` would always give x.
+  SMOKE_ESPEAK_ARG: ${{ inputs.static_espeak && '--static-espeak' || '' }}
+  VS_VCVARS: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat
+  # Every build: specs compiled into the binaries (no model_specs/ beside them), no model manager
+  # (no downloads, no BoringSSL), no optional server frontends, no host-tuned CPU code.
+  # ENGINE_ENABLE_NATIVE_CPU is what audio.cpp forces GGML_NATIVE from; GGML_NATIVE=OFF only says so.
+  # No argument here may contain a space: bash, pwsh and cmd all split this on spaces.
+  COMMON_CMAKE_ARGS: >-
+    -DCMAKE_BUILD_TYPE=Release
+    -DAUDIOCPP_DEPLOYMENT_BUILD=ON
+    -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF
+    -DAUDIOCPP_BUILD_SERVER_FRONTENDS=OFF
+    -DAUDIOCPP_BUILD_C_API=OFF
+    -DENGINE_BUILD_TESTS=OFF
+    -DENGINE_ENABLE_HIP=OFF
+    -DENGINE_ENABLE_NATIVE_CPU=OFF
+    -DGGML_NATIVE=OFF
+    -DENGINE_ENABLE_LLAMAFILE=ON
+  # Upstream's Windows Vulkan SDK at v0.9.3 (.github/workflows/release.yml).
+  VULKAN_VERSION_WIN: "1.4.357.0"
+  # CUDA: the same toolkits as the stable-diffusion.cpp fork, so the core's driver rules are one.
+  # Architecture lists are trimmed against upstream's (every arch real) to keep ggml-cuda small:
+  # SASS for the consumer GPUs Atomic Chat runs on (Ampere 86, Ada 89, Blackwell 120a; GB10/N1X
+  # 121a), PTX floors that the driver JITs for the rest (Pascal 61 on CUDA 12 only, Turing 75, A100
+  # 80; Hopper 90 on arm64). ggml rewrites 12X to 12Xa itself.
+  WIN_CUDA12: "12.8.1"
+  CUDA_ARCHS_CUDA12_X64: "61-virtual;75-virtual;80-virtual;86-real;89-real;120-real"
+  # 13.4 is the first CUDA with Windows on Arm.
+  WIN_CUDA13: "13.4.2"
+  CUDA_ARCHS_CUDA13_X64: "75-virtual;80-virtual;86-real;89-real;120-real"
+  # Linux arm64 uses 13.0 from NVIDIA's SBSA repo, which DGX OS's r580 driver runs.
+  LINUX_CUDA13: "13-0"
+  CUDA_ARCHS_CUDA13_ARM64: "90-virtual;121-real"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      short: ${{ steps.tag.outputs.short }}
+      sha: ${{ steps.tag.outputs.sha }}
+      version: ${{ steps.tag.outputs.version }}
+      selected: ${{ steps.plan.outputs.selected }}
+      all: ${{ steps.plan.outputs.all }}
+      linux: ${{ steps.plan.outputs.linux }}
+      windows_x64: ${{ steps.plan.outputs.windows_x64 }}
+      smoke_linux: ${{ steps.plan.outputs.smoke_linux }}
+      smoke_windows: ${{ steps.plan.outputs.smoke_windows }}
+    steps:
+      # The pipeline matches [cid:<id>] in the run title literally: no spaces or brackets in it.
+      # An existing release without `replace` would fail only in the release job, hours later.
+      - name: Check inputs
+        env:
+          CANDIDATE_ID: ${{ inputs.candidate_id }}
+          PUBLISH: ${{ inputs.publish }}
+          REPLACE: ${{ inputs.replace }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$CANDIDATE_ID" =~ ^[A-Za-z0-9._:-]{1,80}$ ]]; then
+            echo "::error::candidate_id must match ^[A-Za-z0-9._:-]{1,80}\$"
+            exit 1
+          fi
+          if [ "$PUBLISH" = true ] && [ "$REPLACE" != true ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists here; run with replace to overwrite its archives"
+            exit 1
+          fi
+
+      # Only vX.Y.Z: upstream's side tags (v0.9.2-drama3-base-small, -hotfix) are not engine releases.
+      - name: Resolve the upstream tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::upstream_tag must look like v0.9.3"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          refs="$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          sha="$(printf '%s\n' "$refs" | awk '/\^\{\}$/ {print $1}' | head -1)"
+          [ -n "$sha" ] || sha="$(printf '%s\n' "$refs" | awk '{print $1}' | head -1)"
+          if [ -z "$sha" ]; then echo "::error::$UPSTREAM_REPO has no tag $TAG"; exit 1; fi
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:7}"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "$TAG -> $sha"
+
+      - name: Plan the build
+        id: plan
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+
+          env = os.environ
+          def linux(id, arch, variant, cuda_archs="", check_sm="", expect=""):
+              arm = arch == "arm64"
+              return dict(id=id, arch=arch, variant=variant,
+                          runner="ubuntu-24.04-arm" if arm else "ubuntu-24.04",
+                          gcc="14" if arm else "", elf="ARM aarch64" if arm else "x86-64",
+                          cuda_repo=("sbsa" if arm else "x86_64") if cuda_archs else "",
+                          cuda_ver=env["LINUX_CUDA13"] if cuda_archs else "",
+                          cuda_archs=cuda_archs, check_sm=check_sm, expect=expect)
+
+          LINUX = [
+              linux("linux-cpu-x64", "x64", "cpu"),
+              linux("linux-vulkan-x64", "x64", "vulkan", expect="vulkan"),
+              linux("linux-cpu-arm64", "arm64", "cpu"),
+              linux("linux-cuda13-arm64", "arm64", "cuda13", env["CUDA_ARCHS_CUDA13_ARM64"], "sm_121", "cuda"),
+          ]
+          WIN_X64 = [dict(id=f"win-{v}-x64", variant=v) for v in ("cpu", "vulkan", "cuda12", "cuda13")]
+          SINGLE = ["macos-arm64", "win-cpu-arm64", "win-cuda13-arm64"]
+          ALL = [e["id"] for e in LINUX] + [e["id"] for e in WIN_X64] + SINGLE
+
+          raw = env.get("TARGETS", "").strip()
+          sel = list(ALL) if raw in ("", "all") else [t.strip() for t in raw.split(",") if t.strip()]
+          unknown = sorted(set(sel) - set(ALL))
+          if unknown:
+              print(f"::error::unknown targets {unknown}; known: {ALL}")
+              sys.exit(1)
+          build = set(sel)
+          if "win-cuda13-arm64" in build:
+              build.add("win-cpu-arm64")  # its tree is what ggml-cuda.dll is dropped into
+
+          # The backend --version must list; win-cuda13-arm64's server is the clang (CPU) tree, which
+          # loads ggml-cuda.dll at run time but does not list cuda (see atomic/README.md).
+          expect = {"win-vulkan-x64": "vulkan", "win-cuda12-x64": "cuda", "win-cuda13-x64": "cuda"}
+          win_runner = {"x64": ("windows-2022", "x64"), "arm64": ("windows-11-arm", "arm64")}
+          smoke_windows = []
+          for id in ["win-cpu-x64", "win-vulkan-x64", "win-cuda12-x64", "win-cuda13-x64", "win-cpu-arm64", "win-cuda13-arm64"]:
+              if id in sel:
+                  runner, py = win_runner[id.rsplit("-", 1)[1]]
+                  smoke_windows.append(dict(id=id, runner=runner, py_arch=py, expect=expect.get(id, "")))
+
+          out = {
+              "selected": "," + ",".join(sorted(build)) + ",",
+              "all": json.dumps(set(sel) == set(ALL)),
+              "linux": json.dumps([e for e in LINUX if e["id"] in build]),
+              "windows_x64": json.dumps([e for e in WIN_X64 if e["id"] in build]),
+              "smoke_linux": json.dumps([dict(id=e["id"], runner=e["runner"], expect=e["expect"])
+                                         for e in LINUX if e["id"] in sel]),
+              "smoke_windows": json.dumps(smoke_windows),
+          }
+          with open(env["GITHUB_OUTPUT"], "a") as f:
+              for k, v in out.items():
+                  f.write(f"{k}={v}\n")
+                  print(f"{k}={v}")
+          EOF
+
+  # The series must apply to the tag before any runner spends hours on it. The hatchet pipeline reads
+  # a failure of the job named `patches` as a patch conflict (its agent fixes the series in this
+  # branch) and any other failure as a broken build, so keep the id and the name, and keep every
+  # build job behind it. prepare only checks the inputs.
+  patches:
+    name: patches
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Check the patch series
+        run: bash _atomic/atomic/ci/apply-patches.sh --check
+
+  # ----------------------------------------------------------------------------------- macOS
+  # One universal binary, statically linked (no GGML_BACKEND_DL): Metal and the CPU backend are
+  # inside. macos-26 for the Xcode 26 SDK upstream builds with (Metal tensor API on M5).
+  # With static_espeak, eSpeak-ng is an ExternalProject that is only given the compiler, so
+  # CMAKE_OSX_ARCHITECTURES and MACOSX_DEPLOYMENT_TARGET go in through the environment, which every
+  # nested CMake reads; without them its library is arm64 only and the x86_64 slice does not link.
+  macos-arm64:
+    needs: [prepare, patches]
+    if: contains(needs.prepare.outputs.selected, ',macos-arm64,')
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Apply Atomic patches
+        run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-macos-arm64
+          max-size: 1G
+          evict-old-files: job
+
+      # OpenMP off as upstream's macOS build: Apple clang has no libomp.
+      - name: Build
+        env:
+          CMAKE_OSX_ARCHITECTURES: arm64;x86_64
+          MACOSX_DEPLOYMENT_TARGET: "13.3"
+        run: |
+          set -euo pipefail
+          read -r -a common <<< "$COMMON_CMAKE_ARGS"
+          cmake -S . -B build "${common[@]}" \
+            -DAUDIOCPP_VERSION="$VERSION" -DAUDIOCPP_STATIC_ESPEAK="$STATIC_ESPEAK" \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DENGINE_ENABLE_METAL=ON -DENGINE_ENABLE_CUDA=OFF -DENGINE_ENABLE_VULKAN=OFF \
+            -DENGINE_ENABLE_OPENMP=OFF -DGGML_OPENMP=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release -j "$(sysctl -n hw.ncpu)" --target audiocpp_server audiocpp_cli
+
+      - name: Package and verify
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/pkg"
+          rm -rf "$pkg" && mkdir -p "$pkg"
+          cp build/bin/audiocpp_server build/bin/audiocpp_cli "$pkg/"
+          if [ "$STATIC_ESPEAK" = ON ]; then
+            cp build/bin/espeak-ng-data.bin "$pkg/"
+            mkdir -p "$pkg/licenses" && cp -R build/bin/licenses/espeak-ng "$pkg/licenses/"
+            test -f "$pkg/licenses/espeak-ng/COPYING" || { echo "::error::eSpeak-ng licenses missing"; exit 1; }
+          fi
+          cp LICENSE "$pkg/LICENSE"
+          for f in audiocpp_server audiocpp_cli; do
+            archs="$(lipo -archs "$pkg/$f")"
+            echo "$f: $archs"
+            case " $archs " in *" arm64 "*) ;; *) echo "::error::$f has no arm64 slice"; exit 1 ;; esac
+            case " $archs " in *" x86_64 "*) ;; *) echo "::error::$f has no x86_64 slice"; exit 1 ;; esac
+          done
+          # otool prints a "<file> (architecture ...):" header per slice of a universal binary.
+          bad="$(for f in "$pkg/audiocpp_server" "$pkg/audiocpp_cli"; do otool -L "$f" | grep -v ':$' | awk '{print $1}'; done \
+            | grep -v -E '^(/usr/lib/|/System/Library/)' | sort -u || true)"
+          if [ -n "$bad" ]; then echo "$bad"; echo "::error::links outside the OS"; exit 1; fi
+          asset="audio-$TAG-bin-macos-arm64.zip"
+          (cd "$pkg" && zip -X -9 -q -r "$GITHUB_WORKSPACE/$asset" .)
+          ls -lR "$pkg"
+          ls -l "$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-macos-arm64
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------------- Linux
+  # ENGINE_ENABLE_CPU_ALL_VARIANTS: shared ggml, every backend a module ggml loads at run time, and
+  # one CPU module per ISA level picked on the user's machine (upstream's "portable" builds).
+  linux:
+    name: ${{ matrix.id }}
+    needs: [prepare, patches]
+    if: needs.prepare.outputs.linux != '[]'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.linux) }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Apply Atomic patches
+        run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-${{ matrix.id }}
+          max-size: ${{ matrix.cuda_ver != '' && '2G' || '1G' }}
+          evict-old-files: job
+
+      # GCC 14 on arm64: GGML_CPU_ALL_VARIANTS builds armv9.2+SME variants that GCC 13 cannot
+      # assemble (same workaround as llama.cpp's arm64 jobs).
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential ninja-build zip file
+          if [ "${{ matrix.gcc }}" = 14 ]; then
+            sudo apt-get install -y gcc-14 g++-14
+            echo "CC=gcc-14" >> "$GITHUB_ENV"
+            echo "CXX=g++-14" >> "$GITHUB_ENV"
+          fi
+          if [ "$VARIANT" = vulkan ]; then
+            sudo apt-get install -y libvulkan-dev glslc spirv-headers
+          fi
+
+      # SBSA repo for arm64 (the `arm64` repo is Jetson/L4T). cufft: audio.cpp's own CUDA iSTFT;
+      # cuda-driver-dev: the libcuda stub ggml-cuda links (CUDA::cuda_driver).
+      - name: Install CUDA toolkit
+        if: matrix.cuda_ver != ''
+        run: |
+          set -euo pipefail
+          v="${{ matrix.cuda_ver }}"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${{ matrix.cuda_repo }}/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -y
+          sudo apt-get install -y "cuda-nvcc-$v" "cuda-cccl-$v" "cuda-cudart-dev-$v" \
+            "libcublas-dev-$v" "libcufft-dev-$v" "cuda-driver-dev-$v" "cuda-cuobjdump-$v"
+          cuda_home="/usr/local/cuda-${v/-/.}"
+          echo "$cuda_home/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=$cuda_home" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          read -r -a common <<< "$COMMON_CMAKE_ARGS"
+          args=(
+            -G Ninja "${common[@]}"
+            -DAUDIOCPP_VERSION="$VERSION" -DAUDIOCPP_STATIC_ESPEAK="$STATIC_ESPEAK"
+            -DENGINE_ENABLE_CPU_ALL_VARIANTS=ON -DENGINE_ENABLE_METAL=OFF
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          )
+          case "$VARIANT" in
+            cpu) args+=(-DENGINE_ENABLE_VULKAN=OFF -DENGINE_ENABLE_CUDA=OFF) ;;
+            vulkan) args+=(-DENGINE_ENABLE_VULKAN=ON -DENGINE_ENABLE_CUDA=OFF) ;;
+            cuda*)
+              args+=(-DENGINE_ENABLE_VULKAN=OFF -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_CUDA_GRAPHS=ON -DGGML_CUDA_NCCL=OFF
+                     "-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}" -DCMAKE_CUDA_FLAGS=-compress-mode=size
+                     -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
+              if [ "${{ matrix.gcc }}" = 14 ]; then args+=(-DCMAKE_CUDA_HOST_COMPILER=g++-14); fi
+              ;;
+          esac
+          cmake -S . -B build "${args[@]}"
+          cmake --build build -j "$(nproc)" --target audiocpp_server audiocpp_cli
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          asset="audio-$TAG-bin-${{ matrix.id }}.zip"
+          bash _atomic/atomic/ci/package-linux.sh build/bin "$RUNNER_TEMP/pkg" "${CUDA_HOME:-}"
+          (cd "$RUNNER_TEMP/pkg" && zip -X -9 -q -r "$GITHUB_WORKSPACE/$asset" .)
+          ls -l "$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Verify the archive
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/pkg"
+          # Atomic Chat's unzip writes a symlink out as a plain file.
+          if [ -n "$(find "$pkg" -type l)" ]; then find "$pkg" -type l; echo "::error::symlinks in the archive"; exit 1; fi
+          for f in audiocpp_server audiocpp_cli; do test -x "$pkg/$f" || { echo "::error::$f missing"; exit 1; }; done
+          if [ "$STATIC_ESPEAK" = ON ]; then
+            for f in espeak-ng-data.bin licenses/espeak-ng/COPYING; do test -f "$pkg/$f" || { echo "::error::$f missing"; exit 1; }; done
+          fi
+          ls "$pkg"/libggml-cpu*.so >/dev/null || { echo "::error::no CPU backend module"; exit 1; }
+          for f in "$pkg"/*; do
+            if file -b "$f" | grep -q '^ELF'; then
+              file -b "$f" | grep -q "${{ matrix.elf }}" || { echo "::error::$(basename "$f") is not ${{ matrix.elf }}"; exit 1; }
+            fi
+          done
+          missing="$(for f in "$pkg"/*; do [ -f "$f" ] && file -b "$f" | grep -q '^ELF' && LD_LIBRARY_PATH="$pkg" ldd "$f" | sed "s|^|$(basename "$f"): |" | grep 'not found'; done | grep -v -E 'lib(cuda|vulkan)\.so\.1 ' || true)"
+          if [ -n "$missing" ]; then echo "$missing"; echo "::error::unresolved libraries"; exit 1; fi
+          if [ -n "${{ matrix.check_sm }}" ]; then
+            cuobjdump --list-elf "$pkg/libggml-cuda.so" | tee "$RUNNER_TEMP/elf.txt" | tail -3
+            grep -q "${{ matrix.check_sm }}" "$RUNNER_TEMP/elf.txt" || { echo "::error::no ${{ matrix.check_sm }} code in libggml-cuda.so"; exit 1; }
+          fi
+          ls -lR "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.id }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------------------- Windows x64 (MSVC)
+  # ENGINE_ENABLE_CPU_ALL_VARIANTS as on Linux, so CUDA ships as ggml-cuda.dll beside the CPU
+  # modules. Flags follow upstream: scripts/build_windows.ps1 for CPU and Vulkan (OpenMP with
+  # /openmp:experimental), release.yml's windows-cuda job for CUDA (OpenMP off). audiocpp_server.exe
+  # itself imports cudart and cufft on the CUDA builds (audio.cpp's own CUDA kernels): win-cuda12
+  # keeps upstream's layout and leaves the CUDA runtime to the cudart companion the app unpacks
+  # beside it; win-cuda13 carries its runtime inside.
+  windows-x64:
+    name: ${{ matrix.id }}
+    needs: [prepare, patches]
+    if: needs.prepare.outputs.windows_x64 != '[]'
+    runs-on: windows-2022
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.windows_x64) }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Apply Atomic patches
+        shell: bash
+        run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-${{ matrix.id }}
+          max-size: ${{ startsWith(matrix.variant, 'cuda') && '2G' || '1G' }}
+          evict-old-files: job
+
+      - name: Install CUDA 12
+        id: cuda12
+        if: matrix.variant == 'cuda12'
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: ${{ env.WIN_CUDA12 }}
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Install CUDA 13
+        if: matrix.variant == 'cuda13'
+        shell: pwsh
+        run: |
+          & _atomic/atomic/ci/install-cuda-windows.ps1 -Version $env:WIN_CUDA13 -Root "C:\cuda-$env:WIN_CUDA13" -TargetArch x64
+
+      - name: Install Vulkan SDK
+        if: matrix.variant == 'vulkan'
+        shell: pwsh
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION_WIN}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION_WIN}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION_WIN}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION_WIN}\bin"
+
+      - name: Activate MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $common = @($env:COMMON_CMAKE_ARGS -split ' ' | Where-Object { $_ }) + @(
+            "-DAUDIOCPP_VERSION=$env:VERSION", "-DAUDIOCPP_STATIC_ESPEAK=$env:STATIC_ESPEAK",
+            '-DCMAKE_C_COMPILER=cl.exe', '-DCMAKE_CXX_COMPILER=cl.exe',
+            '-DCMAKE_C_FLAGS=/utf-8', '-DCMAKE_CXX_FLAGS=/utf-8 /EHsc',
+            '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL',
+            '-DENGINE_ENABLE_CPU_ALL_VARIANTS=ON', '-DENGINE_ENABLE_METAL=OFF',
+            '-DCMAKE_C_COMPILER_LAUNCHER=ccache', '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache')
+          $openmp = @('-DENGINE_ENABLE_OPENMP=ON', '-DGGML_OPENMP=ON',
+                      '-DOpenMP_C_FLAGS=/openmp:experimental', '-DOpenMP_CXX_FLAGS=/openmp:experimental')
+          $cuda = @('-DENGINE_ENABLE_OPENMP=OFF', '-DGGML_OPENMP=OFF', '-DENGINE_ENABLE_VULKAN=OFF',
+                    '-DENGINE_ENABLE_CUDA=ON', '-DENGINE_ENABLE_CUDA_GRAPHS=ON', '-DGGML_CUDA_NCCL=OFF',
+                    "-DCUDAToolkit_ROOT=$env:CUDA_PATH", '-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -compress-mode=size',
+                    '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache')
+          # @(...): a one-element result would otherwise unroll to a string, and splatting a string
+          # passes it character by character.
+          $extra = @(switch ($env:VARIANT) {
+            'cpu'    { $openmp + @('-DENGINE_ENABLE_VULKAN=OFF', '-DENGINE_ENABLE_CUDA=OFF') }
+            'vulkan' { $openmp + @('-DENGINE_ENABLE_VULKAN=ON', '-DENGINE_ENABLE_CUDA=OFF') }
+            'cuda12' { $cuda + @("-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_CUDA12_X64") }
+            'cuda13' { $cuda + @("-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS_CUDA13_X64") }
+          })
+          cmake -S . -B build -G Ninja @common @extra
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build build -j $env:NUMBER_OF_PROCESSORS --target audiocpp_server audiocpp_cli
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          $opts = @{ BinDir = 'build\bin'; OutDir = $pkg; VcVars = $env:VS_VCVARS; Arch = 'x64'; Espeak = ($env:STATIC_ESPEAK -eq 'ON') }
+          $cudart = @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll', 'cufft64_*.dll')
+          if ($env:VARIANT -eq 'cuda12') { $opts.AllowMissing = $cudart }
+          if ($env:VARIANT -eq 'cuda13') { $opts.CudaRoot = $env:CUDA_PATH; $opts.CheckSm = 'sm_86' }
+          & _atomic/atomic/ci/package-windows.ps1 @opts
+          $asset = "audio-$env:TAG-bin-${{ matrix.id }}.zip"
+          7z a -tzip -mx=9 $asset "$pkg\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          Get-Item $asset | Format-List Name, Length
+          if ($env:VARIANT -eq 'cuda12') {
+            $dst = Join-Path $env:RUNNER_TEMP 'cudart'
+            robocopy "${{ steps.cuda12.outputs.CUDA_PATH }}\bin" $dst @cudart | Out-Null
+            foreach ($pattern in $cudart) {
+              if (-not (Get-ChildItem $dst -Filter $pattern)) { throw "the cudart companion has no $pattern" }
+            }
+            $companion = "audio-$env:TAG-cudart-win-cu12-x64.zip"
+            7z a -tzip -mx=9 $companion "$dst\*" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7z failed on the cudart companion" }
+            Get-Item $companion | Format-List Name, Length
+          }
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.id }}
+          path: |
+            audio-*-bin-win-*-x64.zip
+            audio-*-cudart-win-cu12-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------- Windows on Arm (arm64)
+  # ggml-cpu refuses MSVC on ARM, so the tree is built with clang targeting arm64-pc-windows-msvc
+  # (llama.cpp's flags); -march=armv8.7-a covers Snapdragon X and N1X. Unlike the
+  # stable-diffusion.cpp fork this is a NATIVE build on windows-11-arm, so that static_espeak works
+  # here too: static eSpeak-ng compiles its phoneme data with a tool built in the same tree and
+  # refuses a cross build.
+  # ENGINE_ENABLE_BACKEND_DL (atomic/patches/0001) loads the one CPU backend as ggml-cpu.dll, so the
+  # cuda13 job can drop ggml-cuda.dll in. OpenMP is off: the clang toolchain has no arm64 libomp.
+  # The DLL CRT is explicit: ggml-cuda.dll (MSVC) shares its heap.
+  windows-arm64-cpu:
+    needs: [prepare, patches]
+    if: contains(needs.prepare.outputs.selected, ',win-cpu-arm64,')
+    runs-on: windows-11-arm
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Apply Atomic patches
+        shell: bash
+        run: bash _atomic/atomic/ci/apply-patches.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: arm64
+
+      # The image's Visual Studio edition, LLVM, CMake and Ninja are found, not assumed; CMake and
+      # Ninja fall back to their PyPI wheels (native win_arm64 builds).
+      - name: Locate Visual Studio, clang, CMake and Ninja
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          if (-not $vs) { throw "Visual Studio not found" }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (-not (Test-Path $vcvars)) { throw "$vcvars not found" }
+          "VS_VCVARS=$vcvars" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $clang = @("$vs\VC\Tools\Llvm\ARM64\bin\clang.exe", "$env:ProgramFiles\LLVM\bin\clang.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $clang) { throw "no arm64 clang (VS 'C++ Clang tools' or LLVM) on this image" }
+          Split-Path $clang | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $missing = @('cmake', 'ninja') | Where-Object {
+            -not (Get-Command $_ -ErrorAction SilentlyContinue) -and
+            -not (Test-Path "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\$(if ($_ -eq 'cmake') { 'CMake\bin\cmake.exe' } else { 'Ninja\ninja.exe' })")
+          }
+          if ($missing) {
+            python -m pip install @missing
+            if ($LASTEXITCODE -ne 0) { throw "pip install $missing failed" }
+          }
+          Write-Host "Visual Studio: $vs"
+          Write-Host "clang: $clang"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%VS_VCVARS%" arm64 || exit /b 1
+          where clang cmake ninja
+          cmake -S . -B build -G Ninja %COMMON_CMAKE_ARGS% ^
+            -DCMAKE_TOOLCHAIN_FILE=%GITHUB_WORKSPACE%/_atomic/atomic/cmake/arm64-windows-llvm-native.cmake ^
+            -DAUDIOCPP_VERSION=%VERSION% -DAUDIOCPP_STATIC_ESPEAK=%STATIC_ESPEAK% ^
+            -DENGINE_ENABLE_BACKEND_DL=ON -DENGINE_ENABLE_CPU_ALL_VARIANTS=OFF ^
+            -DENGINE_ENABLE_OPENMP=OFF -DGGML_OPENMP=OFF ^
+            -DENGINE_ENABLE_CUDA=OFF -DENGINE_ENABLE_VULKAN=OFF -DENGINE_ENABLE_METAL=OFF ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL || exit /b 1
+          cmake --build build -j %NUMBER_OF_PROCESSORS% --target audiocpp_server audiocpp_cli || exit /b 1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          & _atomic/atomic/ci/package-windows.ps1 -BinDir build\bin -OutDir $pkg -VcVars $env:VS_VCVARS -Arch arm64 `
+            -Espeak:($env:STATIC_ESPEAK -eq 'ON')
+          if (-not (Test-Path (Join-Path $pkg 'ggml-cpu.dll'))) { throw "ggml-cpu.dll missing: not a GGML_BACKEND_DL tree" }
+          $asset = "audio-$env:TAG-bin-win-cpu-arm64.zip"
+          7z a -tzip -mx=9 $asset "$pkg\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          Get-Item $asset | Format-List Name, Length
+          "ASSET=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-win-cpu-arm64
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tree-win-cpu-arm64
+          path: ${{ runner.temp }}/pkg/
+          if-no-files-found: error
+          retention-days: 3
+
+  # llama.cpp's split: the x64-hosted nvcc and MSVC cross-compile ggml-cuda.dll against NVIDIA's
+  # arm64 libraries and it is dropped into the clang tree. It is built from audio.cpp's vendored
+  # ggml on its own: audio.cpp's CMake only sets GGML_* options (repeated here) and no compile
+  # definitions that would change ggml's structures, and its own top level would want cufft and
+  # OpenMP for arm64. The clang audiocpp_server has no ENGINE_ENABLE_CUDA: it selects the CUDA
+  # backend by registry name, but its own CUDA kernels (iSTFT, torch-compatible RNG) run on the CPU
+  # path and --version lists no cuda (see atomic/README.md).
+  windows-arm64-cuda13:
+    needs: [prepare, patches, windows-arm64-cpu]
+    if: contains(needs.prepare.outputs.selected, ',win-cuda13-arm64,')
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - name: Clone upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          path: _atomic
+          sparse-checkout: atomic
+      - name: Apply Atomic patches
+        shell: bash
+        run: bash _atomic/atomic/ci/apply-patches.sh
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-win-cuda13-arm64
+          max-size: 2G
+          evict-old-files: job
+
+      - name: Install CUDA (x64 compiler, arm64 target libraries)
+        shell: pwsh
+        run: |
+          & _atomic/atomic/ci/install-cuda-windows.ps1 -Version $env:WIN_CUDA13 -Root "C:\cuda-$env:WIN_CUDA13" -TargetArch arm64
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build ggml-cuda
+        shell: cmd
+        run: |
+          call "%VS_VCVARS%" amd64_arm64 || exit /b 1
+          cmake -S external/ggml -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=%GITHUB_WORKSPACE%/_atomic/atomic/cmake/arm64-windows-msvc-cuda.cmake ^
+            -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU=OFF -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON -DGGML_CUDA_NCCL=OFF ^
+            -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF -DGGML_CCACHE=OFF ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
+            "-DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCHS_CUDA13_ARM64%" || exit /b 1
+          cmake --build build-cuda --target ggml-cuda -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Download the clang tree
+        uses: actions/download-artifact@v4
+        with:
+          name: tree-win-cpu-arm64
+          path: ${{ runner.temp }}/pkg
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          $dll = Get-ChildItem build-cuda -Recurse -Filter ggml-cuda.dll | Select-Object -First 1
+          if (-not $dll) { throw "ggml-cuda.dll was not built" }
+          & _atomic/atomic/ci/package-windows.ps1 -OutDir $pkg -VcVars $env:VS_VCVARS -Arch arm64 `
+            -CudaDll $dll.FullName -CudaRoot $env:CUDA_PATH -CheckSm 'sm_121' -Espeak:($env:STATIC_ESPEAK -eq 'ON')
+          $asset = "audio-$env:TAG-bin-win-cuda13-arm64.zip"
+          7z a -tzip -mx=9 $asset "$pkg\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          Get-Item $asset | Format-List Name, Length
+          "ASSET=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-win-cuda13-arm64
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------------------------------- Smoke
+  # On machines without a GPU, every archive must start, list a CPU device and speak through
+  # audiocpp_server's HTTP API on the CPU, the way the core drives it: with MOSS-TTS-Nano 100M,
+  # which needs no eSpeak-ng, and with static_espeak also with Kokoro 82M, which does. Without
+  # static_espeak the archive must carry no eSpeak-ng files. smoke.py pins the models (revision and
+  # SHA-256), so the model cache follows its hash; an older cache is restored and only what no longer
+  # matches is downloaded again.
+  # Linux runs inside a bare python:3.12-slim container, not on the runner, whose build tools would
+  # hide a missing runtime library.
+  smoke-linux:
+    name: smoke ${{ matrix.id }}
+    needs: [prepare, linux]
+    if: always() && needs.prepare.outputs.smoke_linux != '[]' && needs.linux.result == 'success'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.smoke_linux) }}
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+      - uses: actions/download-artifact@v4
+        with:
+          name: archive-${{ matrix.id }}
+          path: dist
+      - name: Unpack
+        run: |
+          mkdir -p "$RUNNER_TEMP/audio"
+          unzip -q dist/*.zip -d "$RUNNER_TEMP/audio"
+          ls -lR "$RUNNER_TEMP/audio"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/audio-smoke-models
+          key: audio-smoke-${{ runner.os }}-${{ inputs.static_espeak && 'kokoro-' || '' }}${{ hashFiles('atomic/ci/smoke.py') }}
+          restore-keys: audio-smoke-${{ runner.os }}-
+
+      - name: Smoke (bare container)
+        env:
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          mkdir -p "$HOME/audio-smoke-models"
+          docker run --rm --user "$(id -u):$(id -g)" -e GITHUB_ACTIONS \
+            -v "$RUNNER_TEMP:$RUNNER_TEMP" -v "$HOME/audio-smoke-models:$HOME/audio-smoke-models" \
+            -v "$PWD/atomic:/atomic:ro" python:3.12-slim \
+            python -I /atomic/ci/smoke.py --dir "$RUNNER_TEMP/audio" \
+              --models-dir "$HOME/audio-smoke-models" \
+              ${EXPECT:+--expect-backend "$EXPECT"} $SMOKE_ESPEAK_ARG \
+              --out-dir "$RUNNER_TEMP/smoke"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.id }}
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # A subset build skips some Windows jobs, so skipped ones are let through; `patches` is listed so
+  # that its failure, which skips all of them, is not.
+  smoke-windows:
+    name: smoke ${{ matrix.id }}
+    needs: [prepare, patches, windows-x64, windows-arm64-cpu, windows-arm64-cuda13]
+    if: >-
+      always() && needs.prepare.outputs.smoke_windows != '[]' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.smoke_windows) }}
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.py_arch }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: archive-${{ matrix.id }}
+          path: dist
+
+      # Every zip of the artifact goes into one folder, the way the app unpacks win-cuda12 and its
+      # cudart companion side by side.
+      - name: Unpack and check PE machine types
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'audio'
+          foreach ($zip in Get-ChildItem dist\*.zip) { Expand-Archive $zip.FullName $dir -Force }
+          & atomic/ci/check-pe.ps1 -Dir $dir -Machine ${{ matrix.py_arch }}
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/audio-smoke-models
+          key: audio-smoke-${{ runner.os }}-${{ matrix.py_arch }}-${{ inputs.static_espeak && 'kokoro-' || '' }}${{ hashFiles('atomic/ci/smoke.py') }}
+          restore-keys: audio-smoke-${{ runner.os }}-${{ matrix.py_arch }}-
+
+      # No NVIDIA driver: ggml-cuda.dll fails to load (no nvcuda.dll) and the CPU device remains,
+      # which is what a machine without NVIDIA sees.
+      - name: Smoke
+        shell: pwsh
+        env:
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          $smokeArgs = @('--dir', (Join-Path $env:RUNNER_TEMP 'audio'),
+                         '--models-dir', (Join-Path $HOME 'audio-smoke-models'),
+                         '--out-dir', (Join-Path $env:RUNNER_TEMP 'smoke'))
+          if ($env:EXPECT) { $smokeArgs += @('--expect-backend', $env:EXPECT) }
+          if ($env:SMOKE_ESPEAK_ARG) { $smokeArgs += $env:SMOKE_ESPEAK_ARG }
+          python -I atomic/ci/smoke.py @smokeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.id }}
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The runner's GPU is an "Apple Paravirtual device" on which ggml's Metal kernels crash (the
+  # stable-diffusion.cpp fork's experience): the archive and the server run on the CPU here,
+  # --version must still list metal, and Metal is checked on real Apple Silicon.
+  # macos-15 runs what macos-26 built (deployment target 13.3).
+  smoke-macos:
+    needs: [prepare, macos-arm64]
+    if: always() && needs.macos-arm64.result == 'success'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+      - uses: actions/download-artifact@v4
+        with:
+          name: archive-macos-arm64
+          path: dist
+      - name: Unpack
+        run: |
+          mkdir -p "$RUNNER_TEMP/audio"
+          unzip -q dist/*.zip -d "$RUNNER_TEMP/audio"
+          ls -lR "$RUNNER_TEMP/audio"
+      - uses: actions/cache@v4
+        with:
+          path: ~/audio-smoke-models
+          key: audio-smoke-${{ runner.os }}-${{ inputs.static_espeak && 'kokoro-' || '' }}${{ hashFiles('atomic/ci/smoke.py') }}
+          restore-keys: audio-smoke-${{ runner.os }}-
+      - name: Smoke
+        run: |
+          python3 -I atomic/ci/smoke.py --dir "$RUNNER_TEMP/audio" --models-dir "$HOME/audio-smoke-models" \
+            --backend cpu --expect-backend metal $SMOKE_ESPEAK_ARG --out-dir "$RUNNER_TEMP/smoke"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-macos-arm64
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ----------------------------------------------------------------------------------- Release
+  release:
+    if: inputs.publish && needs.prepare.outputs.all == 'true'
+    needs: [prepare, macos-arm64, linux, windows-x64, windows-arm64-cpu, windows-arm64-cuda13,
+            smoke-linux, smoke-windows, smoke-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - name: Clone Atomic build files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: atomic
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      # The exact asset set atomic-chat-conf's mirror-audiocpp.yml expects: eleven builds, the cudart
+      # companion, SHA256SUMS.
+      - name: Check the archives, checksums and notes
+        run: |
+          set -euo pipefail
+          ids="macos-arm64 win-cpu-x64 win-vulkan-x64 win-cuda12-x64 win-cuda13-x64 linux-cpu-x64 linux-vulkan-x64 linux-cpu-arm64 win-cpu-arm64 linux-cuda13-arm64 win-cuda13-arm64"
+          expected="$( { for id in $ids; do echo "audio-$TAG-bin-$id.zip"; done; echo "audio-$TAG-cudart-win-cu12-x64.zip"; } | sort)"
+          actual="$(cd dist && ls | sort)"
+          if [ "$expected" != "$actual" ]; then
+            diff <(echo "$expected") <(echo "$actual") || true
+            echo "::error::the archives are not the expected 12"
+            exit 1
+          fi
+          [ "$(echo "$actual" | wc -l)" -eq 12 ] || { echo "::error::expected 12 archives"; exit 1; }
+          (cd dist && sha256sum ./*.zip | sed 's| \./| |' > SHA256SUMS)
+          cat dist/SHA256SUMS
+          shopt -s nullglob
+          patches=(atomic/patches/*.patch)
+          {
+            echo "Atomic builds of [$UPSTREAM_REPO $TAG](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG) (commit \`$SHA\`): every audio.cpp engine Atomic Chat ships."
+            echo
+            echo "| Backend id | Archive |"
+            echo "| --- | --- |"
+            for z in dist/*.zip; do
+              name="$(basename "$z")"
+              case "$name" in
+                *-cudart-win-cu12-x64.zip) id=win-cudart-cu12 ;;
+                *) id="${name#audio-"$TAG"-bin-}"; id="${id%.zip}" ;;
+              esac
+              echo "| \`$id\` | \`$name\` |"
+            done
+            echo
+            echo "Flat archives: \`audiocpp_server\` and \`audiocpp_cli\` beside every runtime library they need (Windows: the VC++ runtime app-locally; win-cuda12-x64 takes its CUDA runtime from the cudart companion), model specs compiled in (\`AUDIOCPP_DEPLOYMENT_BUILD\`), no model manager. Linux archives are symlink-free."
+            echo
+            if [ "$STATIC_ESPEAK" = ON ]; then
+              echo "eSpeak-ng 1.52.0 is linked statically (\`AUDIOCPP_STATIC_ESPEAK\`); its data is \`espeak-ng-data.bin\` beside the server. eSpeak-ng is GPL-3.0-or-later: the binaries that link it are distributed under its terms. Corresponding source: the eSpeak-ng source archive and build scripts in \`licenses/espeak-ng/\` of every archive, and this repository at \`$GITHUB_SHA\` with the upstream tag."
+            else
+              echo "No eSpeak-ng (GPL-3.0-or-later) in these archives, so they are Apache-2.0 only. Models that phonemize with it (Kokoro, Piper, SanoTTS, Inflect v2) cannot speak unless eSpeak-ng is installed on the machine (found in the usual locations or through \`espeak_library_path\`/\`espeak_data_path\`); Qwen3-TTS, MOSS-TTS-Nano, ACE-Step and Stable Audio need none."
+            fi
+            echo
+            if [ ${#patches[@]} -gt 0 ]; then
+              echo "Patches applied on top of the tag:"
+              for patch in "${patches[@]}"; do echo "- \`$(basename "$patch")\`"; done
+            else
+              echo "Source: the upstream tag as is (no patches)."
+            fi
+            echo
+            echo "Built by [release-atomic.yml]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) at \`$GITHUB_SHA\`."
+          } > notes.md
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPLACE: ${{ inputs.replace }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$REPLACE" != true ]; then
+              echo "::error::release $TAG already exists here; run with replace to overwrite its archives"
+              exit 1
+            fi
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+            for name in $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+              if [ ! -e "dist/$name" ]; then
+                echo "removing $name, not in this build"
+                gh release delete-asset "$TAG" "$name" -y -R "$GITHUB_REPOSITORY"
+              fi
+            done
+            gh release edit "$TAG" --notes-file notes.md --title "audio.cpp $TAG (Atomic)" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --target "$SHA" -R "$GITHUB_REPOSITORY" \
+              --title "audio.cpp $TAG (Atomic)" --notes-file notes.md
+          fi

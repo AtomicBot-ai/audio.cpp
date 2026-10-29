@@ -1,0 +1,50 @@
+From: Atomic Chat <noreply@atomic.chat>
+Subject: [PATCH] build: ENGINE_ENABLE_BACKEND_DL for a single dynamically loaded CPU backend
+
+GGML_BACKEND_DL is only reachable through ENGINE_ENABLE_CPU_ALL_VARIANTS, which also turns on
+GGML_CPU_ALL_VARIANTS. ggml has no CPU variant set for Windows on Arm ("Unsupported ARM target
+OS"), so that target could only be built with every backend linked in. Release (Atomic) builds
+win-cuda13-arm64 the way llama.cpp does: the tree with clang, ggml-cuda.dll cross-compiled with
+MSVC + nvcc and dropped in next to it, which needs the backends to be loaded at run time.
+
+ENGINE_ENABLE_BACKEND_DL=ON keeps GGML_CPU_ALL_VARIANTS off and builds the backends, the one CPU
+backend included, as dynamic libraries. Default OFF: no other build changes. Checked on macOS
+arm64 (libggml-cpu.so loaded from beside the server, the server speaks); on macOS, as with
+ENGINE_ENABLE_CPU_ALL_VARIANTS, F5-TTS's weak ggml_graph_compute_with_ctx reference needs
+-Wl,-U,_ggml_graph_compute_with_ctx to link. Windows declares no weak reference.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 807b3707..9d2766ec 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -150,6 +150,9 @@ endif()
+ option(ENGINE_ENABLE_CPU_ALL_VARIANTS
+     "Build CPU backends as dynamic libraries with per-ISA variants (for Docker/portable builds)"
+     OFF)
++option(ENGINE_ENABLE_BACKEND_DL
++    "Build ggml backends as dynamic libraries with a single CPU backend (targets without CPU variants)"
++    OFF)
+ option(ENGINE_BUILD_EXAMPLES "Build example binaries" OFF)
+ option(ENGINE_BUILD_TESTS "Build framework unit tests" OFF)
+ option(ENGINE_BUILD_EXTENDED_TESTS "Build extended non-model tests and probes" OFF)
+@@ -373,6 +376,20 @@ if (ENGINE_ENABLE_CPU_ALL_VARIANTS)
+     # Ensure libraries in the same directory as the binary are found at runtime
+     set(CMAKE_INSTALL_RPATH "\$ORIGIN")
+     set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
++elseif (ENGINE_ENABLE_BACKEND_DL)
++    # ggml has no CPU variant set for some targets (Windows on Arm), but a GPU backend
++    # built elsewhere can still be dropped in next to a single dynamically loaded CPU one.
++    message(STATUS "Backend DL mode: enabling shared libraries + backends as dynamic libs, one CPU backend")
++    set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries" FORCE)
++    set(GGML_BACKEND_DL ON CACHE BOOL "Build backends as dynamic libraries" FORCE)
++    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "Build all CPU backend variants" FORCE)
++    set(GGML_NATIVE ${ENGINE_ENABLE_NATIVE_CPU} CACHE BOOL "Build ggml CPU kernels with native host ISA flags" FORCE)
++    if (APPLE)
++        set(CMAKE_INSTALL_RPATH "@loader_path")
++    else()
++        set(CMAKE_INSTALL_RPATH "\$ORIGIN")
++    endif()
++    set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+ else()
+     set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
+     set(GGML_BACKEND_DL OFF CACHE BOOL "Build backends as dynamic libraries" FORCE)
