@@ -149,6 +149,22 @@ A patch is reworked there (`git apply --3way`, resolve, write the diff of the to
 into the patch keeping its header). Commit only `atomic/` or `release-atomic.yml` on `atomic` (or
 on a sync branch: a dispatch on a branch runs that branch's copy of the workflow).
 
+## Build caches
+
+A release is 11 builds and takes about two hours from cold, so the workflow keeps what the next run can
+reuse, in GitHub's Actions cache of the branch it runs on. Run it from `atomic`, the default branch:
+caches of another branch are not shared with it.
+
+- **Compiler output:** `ccache` on every build (`ggml-org/ccache-action`, key `release-atomic-<backend>`),
+  1 GB per build, 2 GB for CUDA. The action saves it when a job fails too, so a re-run of a failed job
+  picks up where it stopped. A new upstream tag recompiles only what changed.
+- **Toolkits on Windows:** CUDA 13 (`cuda-windows-<version>-<arch>-<script hash>`) and the Vulkan SDK
+  (`vulkan-sdk-windows-x64-<version>`). CUDA 12 goes through `Jimver/cuda-toolkit`'s own cache.
+- **Smoke models:** `audio-smoke-*`, re-downloaded only if a pin in `smoke.py` changes.
+
+GitHub keeps 10 GB per repository and drops the least recently used entries, so a target that has not
+been built for a while starts cold.
+
 ## eSpeak-ng: not shipped
 
 **Decision (2026-10-29): Atomic Chat's audio.cpp builds carry no eSpeak-ng.** eSpeak-ng is

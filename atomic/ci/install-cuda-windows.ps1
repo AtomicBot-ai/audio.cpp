@@ -28,21 +28,27 @@ $parts = [ordered]@{
 }
 if ($TargetArch -eq 'x64') { $parts.libcufft = $libPlatform }
 
-New-Item -ItemType Directory -Force $Root | Out-Null
-foreach ($name in $parts.Keys) {
-  $platform = $parts[$name]
-  $entry = $manifest.$name.$platform
-  if (-not $entry) { throw "redist $Version has no $name for $platform" }
-  $zip = Join-Path $env:RUNNER_TEMP "$name-$platform.zip"
-  Write-Host "$name $($manifest.$name.version) ($platform)"
-  Invoke-WebRequest "$base/$($entry.relative_path)" -OutFile $zip
-  $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-  if ($sha -ne $entry.sha256) { throw "$name sha256 $sha, manifest says $($entry.sha256)" }
-  $tmp = Join-Path $env:RUNNER_TEMP "$name-$platform"
-  Expand-Archive $zip $tmp -Force
-  $top = Get-ChildItem $tmp -Directory | Select-Object -First 1
-  robocopy $top.FullName $Root /E /NFL /NDL /NJH /NJS /NP | Out-Null
-  if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $name ($LASTEXITCODE)" }
+# Written last: a toolkit restored from the workflow's cache has it, a half-unpacked one does not.
+$complete = Join-Path $Root '.atomic-complete'
+if (Test-Path $complete) { Write-Host "CUDA toolkit restored at $Root" }
+else {
+  New-Item -ItemType Directory -Force $Root | Out-Null
+  foreach ($name in $parts.Keys) {
+    $platform = $parts[$name]
+    $entry = $manifest.$name.$platform
+    if (-not $entry) { throw "redist $Version has no $name for $platform" }
+    $zip = Join-Path $env:RUNNER_TEMP "$name-$platform.zip"
+    Write-Host "$name $($manifest.$name.version) ($platform)"
+    Invoke-WebRequest "$base/$($entry.relative_path)" -OutFile $zip
+    $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($sha -ne $entry.sha256) { throw "$name sha256 $sha, manifest says $($entry.sha256)" }
+    $tmp = Join-Path $env:RUNNER_TEMP "$name-$platform"
+    Expand-Archive $zip $tmp -Force
+    $top = Get-ChildItem $tmp -Directory | Select-Object -First 1
+    robocopy $top.FullName $Root /E /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $name ($LASTEXITCODE)" }
+  }
+  Set-Content -Path $complete -Value $Version
 }
 
 "$Root\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH

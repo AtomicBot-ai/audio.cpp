@@ -507,18 +507,35 @@ jobs:
           method: "network"
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "thrust", "visual_studio_integration"]'
 
+      - name: Cache CUDA 13
+        if: matrix.variant == 'cuda13'
+        uses: actions/cache@v4
+        with:
+          path: C:\cuda-${{ env.WIN_CUDA13 }}
+          key: cuda-windows-${{ env.WIN_CUDA13 }}-x64-${{ hashFiles('_atomic/atomic/ci/install-cuda-windows.ps1') }}
+
       - name: Install CUDA 13
         if: matrix.variant == 'cuda13'
         shell: pwsh
         run: |
           & _atomic/atomic/ci/install-cuda-windows.ps1 -Version $env:WIN_CUDA13 -Root "C:\cuda-$env:WIN_CUDA13" -TargetArch x64
 
+      - name: Cache Vulkan SDK
+        id: vulkan-cache
+        if: matrix.variant == 'vulkan'
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK\${{ env.VULKAN_VERSION_WIN }}
+          key: vulkan-sdk-windows-x64-${{ env.VULKAN_VERSION_WIN }}
+
       - name: Install Vulkan SDK
         if: matrix.variant == 'vulkan'
         shell: pwsh
         run: |
-          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION_WIN}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION_WIN}.exe"
-          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          if ('${{ steps.vulkan-cache.outputs.cache-hit }}' -ne 'true') {
+            curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION_WIN}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION_WIN}.exe"
+            & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          }
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION_WIN}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION_WIN}\bin"
 
@@ -624,6 +641,15 @@ jobs:
       - name: Apply Atomic patches
         shell: bash
         run: bash _atomic/atomic/ci/apply-patches.sh
+      # The one build on a native Windows arm64 runner: a build must not fail for want of a cache,
+      # so the Build step uses ccache only if this step put it on PATH.
+      - name: ccache
+        continue-on-error: true
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-atomic-win-cpu-arm64
+          max-size: 1G
+          evict-old-files: job
 
       - uses: actions/setup-python@v5
         with:
@@ -661,7 +687,9 @@ jobs:
         run: |
           call "%VS_VCVARS%" arm64 || exit /b 1
           where clang cmake ninja
-          cmake -S . -B build -G Ninja %COMMON_CMAKE_ARGS% ^
+          set CCACHE_ARGS=
+          where ccache >nul 2>nul && set CCACHE_ARGS=-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake -S . -B build -G Ninja %COMMON_CMAKE_ARGS% %CCACHE_ARGS% ^
             -DCMAKE_TOOLCHAIN_FILE=%GITHUB_WORKSPACE%/_atomic/atomic/cmake/arm64-windows-llvm-native.cmake ^
             -DAUDIOCPP_VERSION=%VERSION% -DAUDIOCPP_STATIC_ESPEAK=%STATIC_ESPEAK% ^
             -DENGINE_ENABLE_BACKEND_DL=ON -DENGINE_ENABLE_CPU_ALL_VARIANTS=OFF ^
@@ -728,6 +756,12 @@ jobs:
           key: release-atomic-win-cuda13-arm64
           max-size: 2G
           evict-old-files: job
+
+      - name: Cache CUDA (x64 compiler, arm64 target libraries)
+        uses: actions/cache@v4
+        with:
+          path: C:\cuda-${{ env.WIN_CUDA13 }}
+          key: cuda-windows-${{ env.WIN_CUDA13 }}-arm64-${{ hashFiles('_atomic/atomic/ci/install-cuda-windows.ps1') }}
 
       - name: Install CUDA (x64 compiler, arm64 target libraries)
         shell: pwsh
