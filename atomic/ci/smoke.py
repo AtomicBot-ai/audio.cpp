@@ -15,8 +15,9 @@ python:3.12-slim container and on a user's machine. Steps, each fatal on failure
      `audiocpp_server --config <generated> --no-ui --backend <backend>` loads it and answers
      `GET /health` with status ok and `GET /v1/models` with the model loaded, and
      `POST /v1/audio/speech` with seeds 1..--repeat returns 200 and a RIFF/WAVE body whose samples
-     are not all zero, each at least --min-seconds long: a build that cuts its speech off answers a
-     valid WAV, and only the length shows it. Any other status fails, with the server's error message.
+     are not all zero, each --min-seconds..--max-seconds long: speech that is cut off or runs on is
+     still a valid WAV, and only the length shows it. Any other status fails, with the server's error
+     message.
   5. With --static-espeak only: the same with Kokoro 82M, which phonemizes with eSpeak-ng (a build
      without it answers Kokoro's speech request with a 500 `Could not load eSpeak-ng`).
 
@@ -74,7 +75,15 @@ MOSS = SmokeModel(
     url=f"{GGUF_REPO}/MOSS-TTS-Nano-100M-GGUF/moss-tts-nano-100m-q8_0.gguf",
     sha256="823b0de64f01f1ee9a168356c1199be500d71ec2f769f0183b416c9e6dbc0abc",
     size=193343328,
-    entry={"id": "moss", "family": "moss_tts_nano", "task": "tts", "mode": "offline"},
+    entry={
+        "id": "moss",
+        "family": "moss_tts_nano",
+        "task": "tts",
+        "mode": "offline",
+        # Quantized weights drift on armv8.6 CPUs (i8mm): speech cut off or running on, same on every
+        # run of a seed. The q8_0 values in f16 storage are what audio.cpp's model docs prescribe.
+        "session_options": {"moss_tts_nano.weight_type": "f16"},
+    },
 )
 # Needs eSpeak-ng: only part of the smoke when the archive links it statically.
 KOKORO = SmokeModel(
@@ -242,9 +251,9 @@ def speak(server: Path, directory: Path, env: dict[str, str], scratch: Path, arg
           model: SmokeModel, model_path: Path) -> None:
     """Start audiocpp_server with this one model, wait until it is healthy with the model loaded,
     synthesize args.text with seeds 1..args.repeat and check every WAV, keeping them as
-    <out-dir>/smoke-<model id>-seed<n>.wav. A clip shorter than args.min_seconds fails the smoke, after
-    every seed has run: a build that cuts its speech off answers a valid, non-silent WAV (0.16 s of a
-    sentence on linux-cpu-arm64 once), and only the length shows it."""
+    <out-dir>/smoke-<model id>-seed<n>.wav. A clip outside args.min_seconds..args.max_seconds fails the
+    smoke, after every seed has run: speech that is cut off or runs on is still a valid, non-silent WAV
+    (0.16 s and 10 s of one sentence on armv8.6 CPUs), and only the length shows it."""
     port = free_port()
     config = {
         "host": "127.0.0.1",
@@ -295,7 +304,7 @@ def speak(server: Path, directory: Path, env: dict[str, str], scratch: Path, arg
             fail(f"/v1/models does not show {model.id} loaded: {body.decode('utf-8', 'replace')[:500]}")
         log(f"PASS /v1/models: {model.id} loaded")
 
-        short: list[str] = []
+        wrong: list[str] = []
         for seed in range(1, args.repeat + 1):
             started = time.time()
             status, content_type, wav = http(
@@ -313,11 +322,11 @@ def speak(server: Path, directory: Path, env: dict[str, str], scratch: Path, arg
             out = args.out_dir / f"smoke-{model.id}-seed{seed}.wav"
             out.write_bytes(wav)
             log(f"/v1/audio/speech ({model.id}, seed {seed}) in {elapsed:.1f}s: {summary} -> {out} ({len(wav)} bytes)")
-            if seconds < args.min_seconds:
-                short.append(f"seed {seed}: {seconds:.2f} s")
-        if short:
-            fail(f"{model.id} cut its speech short (under {args.min_seconds} s): {', '.join(short)}")
-        log(f"PASS /v1/audio/speech ({model.id}): {args.repeat} clips, none under {args.min_seconds} s")
+            if not args.min_seconds <= seconds <= args.max_seconds:
+                wrong.append(f"seed {seed}: {seconds:.2f} s")
+        if wrong:
+            fail(f"{model.id} speech outside {args.min_seconds}..{args.max_seconds} s: {', '.join(wrong)}")
+        log(f"PASS /v1/audio/speech ({model.id}): {args.repeat} clips, all {args.min_seconds}..{args.max_seconds} s")
     finally:
         proc.terminate()
         try:
@@ -341,6 +350,8 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=12, help="clips to make, with seeds 1..N (default 12)")
     parser.add_argument("--min-seconds", type=float, default=1.0,
                         help="shortest believable clip of --text; anything shorter fails (default 1)")
+    parser.add_argument("--max-seconds", type=float, default=8.0,
+                        help="longest believable clip of --text; anything longer fails (default 8)")
     parser.add_argument("--out-dir", type=Path, default=Path(tempfile.gettempdir()) / "audiocpp-smoke",
                         help="where to keep the generated WAVs (smoke-<model>.wav)")
     parser.add_argument("--load-timeout", type=int, default=600)
