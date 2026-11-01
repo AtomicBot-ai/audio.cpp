@@ -149,6 +149,22 @@ A patch is reworked there (`git apply --3way`, resolve, write the diff of the to
 into the patch keeping its header). Commit only `atomic/` or `release-atomic.yml` on `atomic` (or
 on a sync branch: a dispatch on a branch runs that branch's copy of the workflow).
 
+## arm64 Linux: no SVE variants
+
+ggml builds a CPU backend per instruction set and loads the best one a machine runs. The variants with
+SVE (`armv8.2_3`, `armv8.6_*`, `armv9.2_*`) give wrong results with audio.cpp, so `package-linux.sh`
+leaves them out and a CPU with SVE loads `armv8.2_2`.
+
+Measured with MOSS-TTS-Nano q8 on a Neoverse N2 runner, one sentence, seeds 1..12 (v0.9.3): `armv8.0_1`,
+`armv8.2_1` and `armv8.2_2` made 2.8–6.9 s of speech, and the same to the hundredth in an arm64 container
+on an Apple M4; `armv8.2_3`, `armv8.6_1` and `armv8.6_2` made 0.96–10 s, all three identically, on every
+run of a seed. MOSS's `weight_type=f16` does not help (0.08–6.5 s), so it is not quantization or i8mm.
+audio.cpp has no SVE code of its own: the cause is in the vendored ggml, not yet narrowed further.
+
+The clip is a valid, non-silent WAV either way, which is why the smoke bounds its length. Windows arm64
+has one `ggml-cpu.dll` and no variants. Bring the variants back only with a smoke that passes on an SVE
+machine.
+
 ## Build caches
 
 A release is 11 builds and takes about two hours from cold, so the workflow keeps what the next run can

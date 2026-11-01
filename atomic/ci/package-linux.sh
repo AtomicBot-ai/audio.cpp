@@ -28,7 +28,13 @@ for name in audiocpp_server audiocpp_cli; do
   [ -f "$bin/$name" ] || { echo "::error::$name is missing from $bin"; exit 1; }
   cp -L "$bin/$name" "$out/$name"
 done
+# ggml's SVE paths give wrong results with audio.cpp: on a Neoverse N2 every variant with SVE made
+# speech that was cut off or ran on, the same on every run of a seed. Left out, a CPU with SVE loads
+# armv8.2_2, the best variant without it (atomic/README.md).
 for f in "$bin"/*.so; do
+  case "$(basename "$f")" in
+    libggml-cpu-armv8.2_3.so | libggml-cpu-armv8.6_*.so | libggml-cpu-armv9.*.so) continue ;;
+  esac
   if [ -f "$f" ]; then cp -L "$f" "$out/$(basename "$f")"; fi
 done
 if [ -f "$bin/espeak-ng-data.bin" ]; then

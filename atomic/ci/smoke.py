@@ -50,6 +50,8 @@ from typing import NoReturn
 
 ESPEAK_DATA = "espeak-ng-data.bin"
 ESPEAK_LICENSES = Path("licenses") / "espeak-ng"
+# ggml's SVE paths make wrong speech (atomic/README.md); these must not reach an archive.
+SVE_VARIANTS = ("libggml-cpu-armv8.2_3.so", "libggml-cpu-armv8.6_*.so", "libggml-cpu-armv9.*.so")
 
 GGUF_REPO = "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/874fcb41ececda20bcbc0782d6b4ea7f7d069ea8"
 
@@ -75,15 +77,7 @@ MOSS = SmokeModel(
     url=f"{GGUF_REPO}/MOSS-TTS-Nano-100M-GGUF/moss-tts-nano-100m-q8_0.gguf",
     sha256="823b0de64f01f1ee9a168356c1199be500d71ec2f769f0183b416c9e6dbc0abc",
     size=193343328,
-    entry={
-        "id": "moss",
-        "family": "moss_tts_nano",
-        "task": "tts",
-        "mode": "offline",
-        # Quantized weights drift on armv8.6 CPUs (i8mm): speech cut off or running on, same on every
-        # run of a seed. The q8_0 values in f16 storage are what audio.cpp's model docs prescribe.
-        "session_options": {"moss_tts_nano.weight_type": "f16"},
-    },
+    entry={"id": "moss", "family": "moss_tts_nano", "task": "tts", "mode": "offline"},
 )
 # Needs eSpeak-ng: only part of the smoke when the archive links it statically.
 KOKORO = SmokeModel(
@@ -253,7 +247,7 @@ def speak(server: Path, directory: Path, env: dict[str, str], scratch: Path, arg
     synthesize args.text with seeds 1..args.repeat and check every WAV, keeping them as
     <out-dir>/smoke-<model id>-seed<n>.wav. A clip outside args.min_seconds..args.max_seconds fails the
     smoke, after every seed has run: speech that is cut off or runs on is still a valid, non-silent WAV
-    (0.16 s and 10 s of one sentence on armv8.6 CPUs), and only the length shows it."""
+    (0.16 s and 10 s of one sentence on ggml's SVE CPU variants), and only the length shows it."""
     port = free_port()
     config = {
         "host": "127.0.0.1",
@@ -399,6 +393,9 @@ def main() -> None:
                      "(pass --static-espeak for a static_espeak build)")
             log("PASS no eSpeak-ng files (built without eSpeak-ng)")
 
+        sve = sorted(p.name for pattern in SVE_VARIANTS for p in directory.glob(pattern))
+        if sve:
+            fail(f"ggml CPU variants with SVE in the archive: {', '.join(sve)} (package-linux.sh leaves them out)")
         smoke_models = [MOSS, KOKORO] if args.static_espeak else [MOSS]
         for model in smoke_models:
             speak(server, directory, env, scratch, args, model, ensure_model(models_dir, model))
