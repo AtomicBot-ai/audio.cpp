@@ -520,22 +520,14 @@ jobs:
         run: |
           & _atomic/atomic/ci/install-cuda-windows.ps1 -Version $env:WIN_CUDA13 -Root "C:\cuda-$env:WIN_CUDA13" -TargetArch x64
 
-      - name: Cache Vulkan SDK
-        id: vulkan-cache
-        if: matrix.variant == 'vulkan'
-        uses: actions/cache@v4
-        with:
-          path: C:\VulkanSDK\${{ env.VULKAN_VERSION_WIN }}
-          key: vulkan-sdk-windows-x64-${{ env.VULKAN_VERSION_WIN }}
-
+      # Not cached: the installer also puts vulkan-1.dll in System32, which packaging checks imports
+      # against, and it takes a minute or two.
       - name: Install Vulkan SDK
         if: matrix.variant == 'vulkan'
         shell: pwsh
         run: |
-          if ('${{ steps.vulkan-cache.outputs.cache-hit }}' -ne 'true') {
-            curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION_WIN}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION_WIN}.exe"
-            & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
-          }
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION_WIN}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION_WIN}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION_WIN}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION_WIN}\bin"
 

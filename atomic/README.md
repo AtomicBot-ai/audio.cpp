@@ -174,8 +174,9 @@ caches of another branch are not shared with it.
 - **Compiler output:** `ccache` on every build (`ggml-org/ccache-action`, key `release-atomic-<backend>`),
   1 GB per build, 2 GB for CUDA. The action saves it when a job fails too, so a re-run of a failed job
   picks up where it stopped. A new upstream tag recompiles only what changed.
-- **Toolkits on Windows:** CUDA 13 (`cuda-windows-<version>-<arch>-<script hash>`) and the Vulkan SDK
-  (`vulkan-sdk-windows-x64-<version>`). CUDA 12 goes through `Jimver/cuda-toolkit`'s own cache.
+- **Toolkits on Windows:** CUDA 13 (`cuda-windows-<version>-<arch>-<script hash>`). CUDA 12 goes through
+  `Jimver/cuda-toolkit`'s own cache. The Vulkan SDK is installed every time: its installer also puts
+  `vulkan-1.dll` in System32, which packaging checks imports against.
 - **Smoke models:** `audio-smoke-*`, re-downloaded only if a pin in `smoke.py` changes.
 
 GitHub keeps 10 GB per repository and drops the least recently used entries, so a target that has not
