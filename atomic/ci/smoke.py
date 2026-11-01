@@ -14,8 +14,9 @@ python:3.12-slim container and on a user's machine. Steps, each fatal on failure
   4. MOSS-TTS-Nano 100M, which needs neither eSpeak-ng nor a reference voice:
      `audiocpp_server --config <generated> --no-ui --backend <backend>` loads it and answers
      `GET /health` with status ok and `GET /v1/models` with the model loaded, and
-     `POST /v1/audio/speech` returns 200 and a RIFF/WAVE body whose samples are not all zero.
-     Any other status fails, with the server's error message.
+     `POST /v1/audio/speech` with seeds 1..--repeat returns 200 and a RIFF/WAVE body whose samples
+     are not all zero, each at least --min-seconds long: a build that cuts its speech off answers a
+     valid WAV, and only the length shows it. Any other status fails, with the server's error message.
   5. With --static-espeak only: the same with Kokoro 82M, which phonemizes with eSpeak-ng (a build
      without it answers Kokoro's speech request with a 500 `Could not load eSpeak-ng`).
 
@@ -197,7 +198,7 @@ def error_message(body: bytes) -> str:
         return text
 
 
-def check_wav(wav: bytes) -> str:
+def check_wav(wav: bytes) -> tuple[str, float]:
     """Parse a RIFF/WAVE body (PCM or IEEE float) and fail unless it carries non-silent samples."""
     if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
         fail(f"speech body is not RIFF/WAVE (starts {wav[:12]!r})")
@@ -233,13 +234,17 @@ def check_wav(wav: bytes) -> str:
         fail(f"unexpected WAV sample format {audio_format}/{bits} bit")
     if not peak > 1e-3:
         fail(f"WAV is silent (peak {peak:.6f})")
-    return f"{channels} ch, {rate} Hz, {bits}-bit fmt {audio_format}, {frames / rate:.2f} s, peak {peak:.3f}"
+    seconds = frames / rate
+    return f"{channels} ch, {rate} Hz, {bits}-bit fmt {audio_format}, {seconds:.2f} s, peak {peak:.3f}", seconds
 
 
 def speak(server: Path, directory: Path, env: dict[str, str], scratch: Path, args: argparse.Namespace,
           model: SmokeModel, model_path: Path) -> None:
     """Start audiocpp_server with this one model, wait until it is healthy with the model loaded,
-    synthesize args.text and check the WAV; keep it as <out-dir>/smoke-<model id>.wav."""
+    synthesize args.text with seeds 1..args.repeat and check every WAV, keeping them as
+    <out-dir>/smoke-<model id>-seed<n>.wav. A clip shorter than args.min_seconds fails the smoke, after
+    every seed has run: a build that cuts its speech off answers a valid, non-silent WAV (0.16 s of a
+    sentence on linux-cpu-arm64 once), and only the length shows it."""
     port = free_port()
     config = {
         "host": "127.0.0.1",
@@ -290,19 +295,29 @@ def speak(server: Path, directory: Path, env: dict[str, str], scratch: Path, arg
             fail(f"/v1/models does not show {model.id} loaded: {body.decode('utf-8', 'replace')[:500]}")
         log(f"PASS /v1/models: {model.id} loaded")
 
-        started = time.time()
-        status, content_type, wav = http(
-            "POST", f"{base}/v1/audio/speech", {"model": model.id, "input": args.text}, timeout=args.speech_timeout
-        )
-        elapsed = time.time() - started
-        if status != 200:
-            fail(f"/v1/audio/speech ({model.id}) answered {status}: {error_message(wav)[:500]}")
-        if "audio/wav" not in content_type and "audio/x-wav" not in content_type:
-            log(f"note: Content-Type is {content_type!r}")
-        summary = check_wav(wav)
-        out = args.out_dir / f"smoke-{model.id}.wav"
-        out.write_bytes(wav)
-        log(f"PASS /v1/audio/speech ({model.id}) in {elapsed:.1f}s: {summary} -> {out} ({len(wav)} bytes)")
+        short: list[str] = []
+        for seed in range(1, args.repeat + 1):
+            started = time.time()
+            status, content_type, wav = http(
+                "POST",
+                f"{base}/v1/audio/speech",
+                {"model": model.id, "input": args.text, "seed": seed},
+                timeout=args.speech_timeout,
+            )
+            elapsed = time.time() - started
+            if status != 200:
+                fail(f"/v1/audio/speech ({model.id}, seed {seed}) answered {status}: {error_message(wav)[:500]}")
+            if "audio/wav" not in content_type and "audio/x-wav" not in content_type:
+                log(f"note: Content-Type is {content_type!r}")
+            summary, seconds = check_wav(wav)
+            out = args.out_dir / f"smoke-{model.id}-seed{seed}.wav"
+            out.write_bytes(wav)
+            log(f"/v1/audio/speech ({model.id}, seed {seed}) in {elapsed:.1f}s: {summary} -> {out} ({len(wav)} bytes)")
+            if seconds < args.min_seconds:
+                short.append(f"seed {seed}: {seconds:.2f} s")
+        if short:
+            fail(f"{model.id} cut its speech short (under {args.min_seconds} s): {', '.join(short)}")
+        log(f"PASS /v1/audio/speech ({model.id}): {args.repeat} clips, none under {args.min_seconds} s")
     finally:
         proc.terminate()
         try:
@@ -323,6 +338,9 @@ def main() -> None:
     parser.add_argument("--static-espeak", action="store_true",
                         help="the archive links eSpeak-ng (static_espeak): check its files and speak with Kokoro too")
     parser.add_argument("--text", default="Hello from Atomic Chat. This is a smoke test.")
+    parser.add_argument("--repeat", type=int, default=12, help="clips to make, with seeds 1..N (default 12)")
+    parser.add_argument("--min-seconds", type=float, default=1.0,
+                        help="shortest believable clip of --text; anything shorter fails (default 1)")
     parser.add_argument("--out-dir", type=Path, default=Path(tempfile.gettempdir()) / "audiocpp-smoke",
                         help="where to keep the generated WAVs (smoke-<model>.wav)")
     parser.add_argument("--load-timeout", type=int, default=600)
