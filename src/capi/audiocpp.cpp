@@ -135,6 +135,7 @@ engine::core::BackendType parse_backend_type(const std::string & value) {
     if (value == "hip" || value == "rocm") return engine::core::BackendType::Hip;
     if (value == "vulkan") return engine::core::BackendType::Vulkan;
     if (value == "metal") return engine::core::BackendType::Metal;
+    if (value == "webgpu") return engine::core::BackendType::WebGPU;
     if (value == "best") return engine::core::BackendType::BestAvailable;
     throw std::invalid_argument("unsupported backend: " + value);
 }
@@ -553,6 +554,14 @@ audiocpp_status audiocpp_session_create(const audiocpp_model * model,
                                         const audiocpp_backend_config * backend_config,
                                         const audiocpp_options * options,
                                         audiocpp_session ** out_session) {
+    return audiocpp_session_create_with_impl(
+        model, task, mode, backend_config, nullptr, options, out_session);
+}
+
+audiocpp_status audiocpp_session_create_with_impl(
+        const audiocpp_model * model, const char * task, const char * mode,
+        const audiocpp_backend_config * backend_config, const char * impl,
+        const audiocpp_options * options, audiocpp_session ** out_session) {
     if (model == nullptr || task == nullptr || mode == nullptr || out_session == nullptr) {
         return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "model, task, mode and out_session must be non-null");
     }
@@ -571,6 +580,7 @@ audiocpp_status audiocpp_session_create(const audiocpp_model * model,
             session_options.backend.device = backend_config->device;
             session_options.backend.threads = backend_config->threads;
         }
+        session_options.backend.impl = impl ? impl : "";
         session_options.options = option_map(options);
 
         auto handle = std::make_unique<audiocpp_session>();
