@@ -127,7 +127,7 @@ AUDIOCPP_API audiocpp_status audiocpp_registry_family(const audiocpp_registry * 
  *
  * The tasks this build knows, askable without a model. Every other task-aware
  * entry point takes an audiocpp_model, so a caller that is deciding what to
- * install -- reading model_specs/*.json to build a picker, say -- has had
+ * install -- reading JSON files in model_specs/ to build a picker, say -- has had
  * nothing to ask and has had to hardcode a copy of the table in
  * src/framework/model_spec/metadata.cpp.
  *
@@ -235,7 +235,7 @@ AUDIOCPP_API audiocpp_status audiocpp_model_option(const audiocpp_model * model,
 /* Session                                                             */
 /* ------------------------------------------------------------------ */
 
-/* backend is "cpu", "cuda", "hip"/"rocm", "vulkan", "metal" or "best";
+/* backend is "cpu", "cuda", "hip"/"rocm", "vulkan", "metal", "webgpu" or "best";
  * NULL means "cpu". device and threads mirror --device / --threads. */
 typedef struct audiocpp_backend_config {
     const char * backend;
@@ -251,6 +251,11 @@ AUDIOCPP_API audiocpp_status audiocpp_session_create(const audiocpp_model * mode
                                                       const audiocpp_backend_config * backend_config,
                                                       const audiocpp_options * options,
                                                       audiocpp_session ** out_session);
+/* Same operation with an explicit backend implementation. NULL/empty means default. */
+AUDIOCPP_API audiocpp_status audiocpp_session_create_with_impl(
+    const audiocpp_model * model, const char * task, const char * mode,
+    const audiocpp_backend_config * backend_config, const char * impl,
+    const audiocpp_options * options, audiocpp_session ** out_session);
 AUDIOCPP_API void            audiocpp_session_free(audiocpp_session * session);
 
 AUDIOCPP_API const char * audiocpp_session_family(const audiocpp_session * session);
