@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { randomUUID } from '$lib/uuid.js';
   import { onMount } from 'svelte';
   import { Users, Upload, Search, Save, Trash2, Download, FileText, Mic } from '@lucide/svelte';
   import { listVoices, saveVoice, deleteVoice, exportVoiceLibrary, importVoiceLibrary, type SavedVoice } from '$lib/library';
@@ -21,7 +22,6 @@
     ? a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }) || a.id.localeCompare(b.id)
     : b.createdAt - a.createdAt);
   $: dirty = !!draft && (!original || draft.name !== original.name || draft.transcript !== original.transcript || draft.audio !== original.audio);
-  $: previewFile = draft ? new File([draft.audio], `${draft.name}.wav`, { type: 'audio/wav' }) : null;
 
   export function canClose() {
     return !busy && (!dirty || confirm('Discard unsaved voice edits?'));
@@ -39,7 +39,7 @@
     busy = true; error = '';
     try {
       const audio = await browserDecodeToWav(file);
-      draft = { id: crypto.randomUUID(), name: file.name.replace(/\.[^.]+$/, ''), transcript: '', audio, createdAt: Date.now() };
+      draft = { id: randomUUID(), name: file.name.replace(/\.[^.]+$/, ''), transcript: '', audio, createdAt: Date.now() };
       original = undefined;
     } catch (e) { error = `Cannot import ${file.name}: ${String(e)}`; }
     finally { busy = false; input.value = ''; }
@@ -138,7 +138,7 @@
     <aside class="voice-editor">
       {#if draft}
         <label>Name<input aria-label="Voice name" bind:value={draft.name} disabled={busy}/></label>
-        <MediaPreview file={previewFile} label="Voice preview"/>
+        <MediaPreview file={draft.audio} name={draft.name} label="Voice preview"/>
         <label>Words spoken in the recording (optional)<textarea aria-label="Voice transcript" rows="5" bind:value={draft.transcript} disabled={busy}></textarea></label>
         <div class="tools">
           <button class="primary" disabled={busy || !dirty} on:click={save}><Save size={16}/>{dirty ? 'Save voice' : 'Saved'}</button>

@@ -1,6 +1,7 @@
 #include "engine/community_models/fish_drama3/backbone.h"
 
 #include "engine/framework/core/backend.h"
+#include "engine/framework/core/prepared_graph.h"
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/core/disk_expert_weight_store.h"
 #include "engine/framework/debug/profiler.h"
@@ -8,6 +9,8 @@
 #include "engine/framework/modules/feed_forward_modules.h"
 #include "engine/framework/modules/attention/grouped_query_attention.h"
 #include "engine/framework/modules/linear_module.h"
+#include "engine/framework/modules/moe_module.h"
+#include "engine/framework/modules/staged_moe_runtime.h"
 #include "engine/framework/modules/lookup_modules.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/optimizations/fast_kv_modules.h"
@@ -46,109 +49,6 @@ struct GgmlContextDeleter {
         if (ctx != nullptr) {
             ggml_free(ctx);
         }
-    }
-};
-
-struct GgmlGallocrDeleter {
-    void operator()(ggml_gallocr_t alloc) const noexcept {
-        if (alloc != nullptr) {
-            ggml_gallocr_free(alloc);
-        }
-    }
-};
-
-// Keep graph activations on the backend that executes each split. Expert banks
-// in host RAM are consumed there instead of being copied to the GPU per step.
-class HybridGraphAllocator {
-public:
-    ~HybridGraphAllocator() { reset(); }
-    void reset() {
-        if (scheduler_) {
-            // CUDA capture keys are first-node pointers. Scheduler split views
-            // borrow nodes from this graph, so visiting its nodes also covers
-            // all capture keys without accessing scheduler internals.
-            if (graph_ && cleanup_graph_) {
-                for (int node = 0; node < ggml_graph_n_nodes(graph_); ++node) {
-                    ggml_graph_set_n_nodes(cleanup_graph_, 0);
-                    ggml_graph_add_node(cleanup_graph_, ggml_graph_node(graph_, node));
-                    core::release_backend_graph_resources(primary_, cleanup_graph_, true);
-                }
-            }
-            ggml_backend_sched_free(scheduler_);
-        }
-        if (allocator_) ggml_gallocr_free(allocator_);
-        scheduler_ = nullptr;
-        allocator_ = nullptr;
-        graph_ = nullptr;
-        cleanup_graph_ = nullptr;
-        cleanup_context_.reset();
-    }
-    bool allocate(ggml_cgraph * graph, ggml_backend_t primary, ggml_backend_t cpu,
-                  core::DiskExpertWeightStore * disk_experts = nullptr) {
-        reset();
-        primary_ = primary;
-        cpu_ = cpu;
-        graph_ = graph;
-        if (cpu || disk_experts) {
-            // Allocate the cleanup view with the graph, not in its destructor.
-            cleanup_context_.reset(ggml_init({ggml_graph_overhead_custom(1, false) + 1024, nullptr, true}));
-            if (!cleanup_context_) return false;
-            cleanup_graph_ = ggml_new_graph_custom(cleanup_context_.get(), 1, false);
-            ggml_backend_t backends[] = {primary, cpu};
-            scheduler_ = ggml_backend_sched_new(backends, nullptr, cpu ? 2 : 1, 65536, false, false);
-            if (scheduler_ && disk_experts) ggml_backend_sched_set_eval_callback(
-                scheduler_, core::DiskExpertWeightStore::evaluate, disk_experts);
-            return scheduler_ && ggml_backend_sched_alloc_graph(scheduler_, graph);
-        }
-        allocator_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(primary));
-        return allocator_ && ggml_gallocr_alloc_graph(allocator_, graph);
-    }
-    ggml_status compute(ggml_backend_t primary, ggml_cgraph * graph, const char * label) {
-        return scheduler_ ? ggml_backend_sched_graph_compute(scheduler_, graph)
-                          : core::compute_backend_graph(primary, graph, nullptr, label);
-    }
-    size_t buffer_bytes() const {
-        if (scheduler_) {
-            return ggml_backend_sched_get_buffer_size(scheduler_, primary_) +
-                (cpu_ ? ggml_backend_sched_get_buffer_size(scheduler_, cpu_) : 0);
-        }
-        return allocator_ ? ggml_gallocr_get_buffer_size(allocator_, 0) : 0;
-    }
-private:
-    ggml_backend_sched_t scheduler_ = nullptr;
-    ggml_gallocr_t allocator_ = nullptr;
-    ggml_backend_t primary_ = nullptr;
-    ggml_backend_t cpu_ = nullptr;
-    ggml_cgraph * graph_ = nullptr;
-    std::unique_ptr<ggml_context, GgmlContextDeleter> cleanup_context_;
-    ggml_cgraph * cleanup_graph_ = nullptr;
-};
-
-struct GraphMemory {
-    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx;
-    std::unique_ptr<ggml_context, GgmlContextDeleter> input_ctx;
-    std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> gallocr;
-    HybridGraphAllocator hybrid;
-    ggml_backend_buffer_t input_buffer = nullptr;
-    ggml_cgraph * graph = nullptr;
-
-    ~GraphMemory() {
-        reset(nullptr);
-    }
-
-    void reset(ggml_backend_t backend) {
-        if (graph != nullptr && backend != nullptr) {
-            core::release_backend_graph_resources(backend, graph, true);
-        }
-        graph = nullptr;
-        hybrid.reset();
-        gallocr.reset();
-        if (input_buffer != nullptr) {
-            ggml_backend_buffer_free(input_buffer);
-            input_buffer = nullptr;
-        }
-        input_ctx.reset();
-        ctx.reset();
     }
 };
 
@@ -200,10 +100,8 @@ struct Drama3BackboneLayerWeights {
 };
 
 struct Drama3BackboneWeights {
-    std::shared_ptr<core::ExecutionContext> cpu_execution;
     std::shared_ptr<core::BackendWeightStore> store;
-    std::shared_ptr<core::BackendWeightStore> cpu_store;
-    std::unique_ptr<core::DiskExpertWeightStore> disk_store;
+    std::unique_ptr<core::MoeResources> experts;
     core::TensorValue token_embedding;
     std::vector<Drama3BackboneLayerWeights> layers;
     modules::NormWeights final_norm;
@@ -296,26 +194,9 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
         "drama3_backbone.weights",
         weight_context_bytes);
     const auto & c = config;
-    if (c.cpu_expert_layers < 0 || c.cpu_expert_layers > c.layers) {
-        throw std::runtime_error("Drama 3 cpu_expert_layers must be between zero and the layer count");
-    }
-    if ((c.cpu_expert_layers > 0 || c.disk_experts) && execution.backend_type() != core::BackendType::Cpu) {
-        core::BackendConfig host;
-        host.threads = execution.config().threads;
-        weights->cpu_execution = std::make_shared<core::ExecutionContext>(host);
-        if (!c.disk_experts) weights->cpu_store = std::make_shared<core::BackendWeightStore>(
-            weights->cpu_execution->backend(), core::BackendType::Cpu,
-            "drama3_backbone.host_experts", weight_context_bytes);
-    }
+    weights->experts = std::make_unique<core::MoeResources>(execution, source, *weights->store,
+        c.moe, "drama3_backbone.host_experts", weight_context_bytes);
     const std::string & root = c.weight_prefix;
-    if (c.disk_experts) {
-        if (storage_type != assets::TensorStorageType::Native)
-            throw std::runtime_error("Drama 3 disk experts require native GGUF weight types");
-        if (c.expert_cache_size < c.experts_per_token || c.expert_cache_size > c.experts)
-            throw std::runtime_error("Drama 3 expert_cache_size must cover top-k and not exceed the expert count");
-        weights->disk_store = std::make_unique<core::DiskExpertWeightStore>(source.source_path(), c.pin_experts,
-            static_cast<size_t>(c.disk_expert_read_threads));
-    }
     weights->token_embedding = weights->store->load_tensor(
         source,
         root + ".embed_tokens.weight",
@@ -344,22 +225,19 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
         const int64_t layer_experts = c.experts_per_layer.empty() ? c.experts : c.experts_per_layer[static_cast<size_t>(layer)];
         out.router = weights->store->load_tensor(source, prefix + ".mlp.gate.weight", storage_type, {layer_experts, c.hidden_size});
         out.shared_gate = weights->store->load_tensor(source, prefix + ".mlp.shared_expert_gate.weight", storage_type, {1, c.hidden_size});
-        if (weights->disk_store) {
-            out.disk_store = weights->disk_store.get();
-            const auto backend = weights->cpu_execution && layer < c.cpu_expert_layers
-                ? weights->cpu_execution->backend() : execution.backend();
-            const auto bank = "model_weights/" + prefix + ".mlp.experts.";
-            out.disk_group = out.disk_store->add_group({bank + "gate_proj.weight", bank + "up_proj.weight",
-                bank + "down_proj.weight"}, backend, c.expert_cache_size);
-            out.expert_gate = out.disk_store->tensor(out.disk_group, 0);
-            out.expert_up = out.disk_store->tensor(out.disk_group, 1);
-            out.expert_down = out.disk_store->tensor(out.disk_group, 2);
-        } else {
-            auto & expert_store = weights->cpu_store && layer < c.cpu_expert_layers ? *weights->cpu_store : *weights->store;
-            out.expert_gate = expert_store.load_tensor(source, prefix + ".mlp.experts.gate_proj.weight", storage_type, {layer_experts, c.intermediate_size, c.hidden_size});
-            out.expert_up = expert_store.load_tensor(source, prefix + ".mlp.experts.up_proj.weight", storage_type, {layer_experts, c.intermediate_size, c.hidden_size});
-            out.expert_down = expert_store.load_tensor(source, prefix + ".mlp.experts.down_proj.weight", storage_type, {layer_experts, c.hidden_size, c.intermediate_size});
-        }
+        const auto bank = prefix + ".mlp.experts.";
+        const auto & experts = weights->experts->bind_layer(static_cast<size_t>(layer), static_cast<size_t>(layer), {
+            {bank + "gate_proj.weight", "model_weights/" + bank + "gate_proj.weight",
+                {layer_experts, c.intermediate_size, c.hidden_size}, storage_type},
+            {bank + "up_proj.weight", "model_weights/" + bank + "up_proj.weight",
+                {layer_experts, c.intermediate_size, c.hidden_size}, storage_type},
+            {bank + "down_proj.weight", "model_weights/" + bank + "down_proj.weight",
+                {layer_experts, c.hidden_size, c.intermediate_size}, storage_type}}, c.experts_per_token);
+        out.disk_store = experts.disk_store;
+        out.disk_group = experts.disk_group;
+        out.expert_gate = experts.weights[0];
+        out.expert_up = experts.weights[1];
+        out.expert_down = experts.weights[2];
         weights->layers.push_back(std::move(out));
     }
     auto final_scale = source.require_f32(root + ".norm.weight", {c.hidden_size});
@@ -378,7 +256,7 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
             false);
     }
     weights->store->upload();
-    if (weights->cpu_store) weights->cpu_store->upload();
+    weights->experts->finalize_weights();
     return weights;
 }
 
@@ -460,16 +338,13 @@ Drama3MoeInputs build_moe_inputs(
     auto * shared_output = ggml_mul(ctx.ggml, shared.tensor, shared_scale);
     const int64_t steps = ggml_nelements(x.tensor) / config.hidden_size;
     auto * hidden = ggml_reshape_2d(ctx.ggml, x.tensor, config.hidden_size, steps);
-    auto * router_logits = ggml_mul_mat(ctx.ggml, weights.router.tensor, hidden);
-    auto * probabilities = ggml_soft_max(ctx.ggml, router_logits);
-    auto * expert_ids = ggml_argsort_top_k(ctx.ggml, probabilities, config.experts_per_token);
-    // Preserve the offload prefill's unfused routing arithmetic.
-    if (weights.disk_store && !ggml_is_contiguous(expert_ids)) expert_ids = ggml_cont(ctx.ggml, expert_ids);
-    const int64_t experts = weights.router.tensor->ne[1];  // per layer (adaptive pruning)
-    auto * selected = ggml_get_rows(ctx.ggml, ggml_reshape_3d(ctx.ggml, probabilities, 1, experts, steps), expert_ids);
-    selected = ggml_reshape_2d(ctx.ggml, selected, config.experts_per_token, steps);
-    selected = ggml_div(ctx.ggml, selected, ggml_sum_rows(ctx.ggml, selected));
-    return {ggml_reshape_2d(ctx.ggml, shared_output, config.hidden_size, steps), expert_ids, selected};
+    modules::MoeRoutingConfig routing_config;
+    routing_config.experts = weights.router.tensor->ne[1]; // per-layer adaptive pruning
+    routing_config.selected = config.experts_per_token;
+    // Preserve offload's original unfused routing arithmetic.
+    routing_config.contiguous_ids = weights.disk_store != nullptr;
+    auto routing = modules::MoeModule::build_routing(ctx, hidden, weights.router.tensor, nullptr, routing_config);
+    return {ggml_reshape_2d(ctx.ggml, shared_output, config.hidden_size, steps), routing.ids, routing.weights};
 }
 
 core::TensorValue mlp(
@@ -482,18 +357,12 @@ core::TensorValue mlp(
     if (routing_graph && !weights.disk_store) ggml_build_forward_expand(routing_graph, inputs.scales);
     const int64_t steps = ggml_nelements(x.tensor) / config.hidden_size;
     auto * hidden = ggml_reshape_2d(ctx.ggml, x.tensor, config.hidden_size, steps);
-    auto * expert_ids = inputs.ids;
-    if (weights.disk_store) expert_ids = weights.disk_store->route(ctx, expert_ids, weights.disk_group);
-    auto * expanded_hidden = ggml_reshape_3d(ctx.ggml, hidden, config.hidden_size, 1, steps);
-    auto * expert_gate = ggml_mul_mat_id(ctx.ggml, weights.expert_gate.tensor, expanded_hidden, expert_ids);
-    auto * expert_up = ggml_mul_mat_id(ctx.ggml, weights.expert_up.tensor, expanded_hidden, expert_ids);
-    auto * expert_activated = routing_graph ? ggml_swiglu_split(ctx.ggml, expert_gate, expert_up)
-                                          : ggml_mul(ctx.ggml, ggml_silu(ctx.ggml, expert_gate), expert_up);
-    auto * expert_output = ggml_mul_mat_id(ctx.ggml, weights.expert_down.tensor, expert_activated, expert_ids);
-    auto * routing_scale = ggml_reshape_3d(ctx.ggml, inputs.scales, 1, config.experts_per_token, steps);
-    expert_output = ggml_mul(ctx.ggml, expert_output, routing_scale);
-    expert_output = ggml_cont(ctx.ggml, ggml_permute(ctx.ggml, expert_output, 1, 0, 2, 3));
-    expert_output = ggml_reshape_2d(ctx.ggml, ggml_sum_rows(ctx.ggml, expert_output), config.hidden_size, steps);
+    auto * bank_ids = weights.disk_store ? weights.disk_store->route(ctx, inputs.ids, weights.disk_group) : nullptr;
+    modules::MoeExpertConfig expert_config;
+    expert_config.fused_swiglu = routing_graph != nullptr;
+    const modules::MoeModule moe(expert_config);
+    auto * expert_output = moe.build(ctx, hidden, {inputs.ids, inputs.scales},
+        {weights.expert_up.tensor, weights.expert_gate.tensor, weights.expert_down.tensor}, bank_ids);
     auto * output = ggml_add(ctx.ggml, expert_output, inputs.shared);
     return round_activation(ctx, core::wrap_tensor(ggml_reshape_3d(ctx.ggml, output, config.hidden_size, steps, 1), x.shape), config);
 }
@@ -935,6 +804,7 @@ LinearAttentionCachedOutput linear_attention_cached(
     return {std::move(output), std::move(next_tail), std::move(next_state)};
 }
 
+
 class BackboneForwardGraph {
 public:
     BackboneForwardGraph(
@@ -947,19 +817,13 @@ public:
           config_(config),
           graph_arena_bytes_(graph_arena_bytes) {}
 
-    ~BackboneForwardGraph() {
-        mem_.reset(execution_.backend());
-    }
-
     Drama3BackboneDecoderForwardResult run(const std::vector<float> & embeddings, int64_t steps) {
         if (steps <= 0 || static_cast<int64_t>(embeddings.size()) != steps * config_.hidden_size) {
             throw std::runtime_error("Drama 3 backbone embedding input size mismatch");
         }
         ensure(steps);
         core::write_tensor_f32(core::wrap_tensor(input_, core::TensorShape::from_dims({1, steps, config_.hidden_size})), embeddings);
-        if (mem_.hybrid.compute(execution_.backend(), mem_.graph, "drama3_backbone.forward") != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("Drama 3 backbone graph compute failed");
-        }
+        prepared_->compute();
         Drama3BackboneDecoderForwardResult out;
         out.steps = steps;
         const int64_t expected_output_values = steps * config_.hidden_size;
@@ -974,7 +838,7 @@ public:
     }
 
     void release_graph() {
-        mem_.reset(execution_.backend());
+        prepared_.reset();
         steps_ = 0;
         input_ = nullptr;
         positions_ = nullptr;
@@ -985,22 +849,20 @@ public:
 
 private:
     void ensure(int64_t steps) {
-        if (mem_.graph != nullptr && steps_ == steps) {
+        if (prepared_ != nullptr && steps_ == steps) {
             return;
         }
-        mem_.reset(execution_.backend());
-        ggml_init_params params{graph_arena_bytes_, nullptr, true};
-        mem_.ctx.reset(ggml_init(params));
-        ggml_init_params input_params{16ull * 1024ull * 1024ull, nullptr, true};
-        mem_.input_ctx.reset(ggml_init(input_params));
-        core::ModuleBuildContext ctx{mem_.ctx.get(), "drama3_backbone.forward", execution_.backend_type()};
-        core::ModuleBuildContext input_ctx{mem_.input_ctx.get(), "drama3_backbone.forward.inputs", execution_.backend_type()};
+        prepared_.reset();
+        auto candidate = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+            "drama3_backbone.forward", graph_arena_bytes_, 65536, 16ull * 1024ull * 1024ull});
+        auto & ctx = candidate->build_context();
+        auto & input_ctx = candidate->persistent_build_context();
         auto x = core::make_tensor(input_ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, steps, config_.hidden_size}));
         input_ = x.tensor;
         ggml_set_input(input_);
         auto positions = core::make_tensor(input_ctx, GGML_TYPE_I32, core::TensorShape::from_dims({steps}));
         positions_ = positions.tensor;
-        attention_mask_ = ggml_new_tensor_4d(mem_.input_ctx.get(), GGML_TYPE_F16, steps, steps, 1, 1);
+        attention_mask_ = ggml_new_tensor_4d(input_ctx.ggml, GGML_TYPE_F16, steps, steps, 1, 1);
         ggml_set_input(attention_mask_);
         auto attention_mask = core::wrap_tensor(
             attention_mask_,
@@ -1039,14 +901,10 @@ private:
         x = round_activation(ctx, x, config_);
         output_ = core::ensure_backend_addressable_layout(ctx, x).tensor;
         ggml_set_output(output_);
-        mem_.graph = ggml_new_graph_custom(mem_.ctx.get(), 65536, false);
-        ggml_build_forward_expand(mem_.graph, output_);
-        mem_.input_buffer = ggml_backend_alloc_ctx_tensors(mem_.input_ctx.get(), execution_.backend());
-        if (mem_.input_buffer == nullptr || !mem_.hybrid.allocate(mem_.graph, execution_.backend(),
-                weights_->cpu_execution ? weights_->cpu_execution->backend() : nullptr, weights_->disk_store.get())) {
-            mem_.reset(execution_.backend());
-            throw std::runtime_error("failed to allocate Drama 3 backbone graph");
-        }
+        ggml_build_forward_expand(candidate->graph(), output_);
+        candidate->allocate_persistent();
+        weights_->experts->configure_scheduler(*candidate);
+        candidate->allocate();
         const auto pos = position_ids(steps);
         ggml_backend_tensor_set(positions_, pos.data(), 0, pos.size() * sizeof(int32_t));
         const auto mask = modules::causal_prefill_mask_values(1, steps);
@@ -1057,6 +915,7 @@ private:
         for (ggml_tensor * state : state_inputs_) {
             ggml_backend_tensor_set(state, zero_state.data(), 0, zero_state.size() * sizeof(float));
         }
+        prepared_ = std::move(candidate);
         steps_ = steps;
     }
 
@@ -1064,7 +923,7 @@ private:
     std::shared_ptr<const Drama3BackboneWeights> weights_;
     Drama3BackboneDecoderConfig config_;
     size_t graph_arena_bytes_;
-    GraphMemory mem_;
+    std::unique_ptr<core::PreparedGraph> prepared_;
     int64_t steps_ = 0;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * positions_ = nullptr;
@@ -1085,10 +944,6 @@ public:
           config_(config),
           graph_arena_bytes_(graph_arena_bytes) {}
 
-    ~TokenEmbeddingGraph() {
-        mem_.reset(execution_.backend());
-    }
-
     std::vector<float> run(const std::vector<int32_t> & token_ids) {
         if (token_ids.empty()) {
             throw std::runtime_error("Drama 3 backbone token embedding requires tokens");
@@ -1096,14 +951,12 @@ public:
         const int64_t steps = static_cast<int64_t>(token_ids.size());
         ensure(steps);
         ggml_backend_tensor_set(input_, token_ids.data(), 0, token_ids.size() * sizeof(int32_t));
-        if (core::compute_backend_graph(execution_.backend(), mem_.graph, nullptr, "drama3_backbone.token_embedding") != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("Drama 3 backbone token embedding graph compute failed");
-        }
+        prepared_->compute();
         return core::read_tensor_f32(output_);
     }
 
     void release_graph() {
-        mem_.reset(execution_.backend());
+        prepared_.reset();
         steps_ = 0;
         input_ = nullptr;
         output_ = nullptr;
@@ -1111,32 +964,24 @@ public:
 
 private:
     void ensure(int64_t steps) {
-        if (mem_.graph != nullptr && steps_ == steps) {
+        if (prepared_ != nullptr && steps_ == steps) {
             return;
         }
-        mem_.reset(execution_.backend());
-        ggml_init_params params{graph_arena_bytes_, nullptr, true};
-        mem_.ctx.reset(ggml_init(params));
-        ggml_init_params input_params{8ull * 1024ull * 1024ull, nullptr, true};
-        mem_.input_ctx.reset(ggml_init(input_params));
-        core::ModuleBuildContext ctx{mem_.ctx.get(), "drama3_backbone.token_embedding", execution_.backend_type()};
-        core::ModuleBuildContext input_ctx{mem_.input_ctx.get(), "drama3_backbone.token_embedding.inputs", execution_.backend_type()};
+        prepared_.reset();
+        auto candidate = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+            "drama3_backbone.token_embedding", graph_arena_bytes_, 4096, 8ull * 1024ull * 1024ull});
+        auto & ctx = candidate->build_context();
+        auto & input_ctx = candidate->persistent_build_context();
         auto ids = core::make_tensor(input_ctx, GGML_TYPE_I32, core::TensorShape::from_dims({steps}));
         input_ = ids.tensor;
         ggml_set_input(input_);
         auto x = modules::EmbeddingModule({config_.vocab_size, config_.hidden_size}).build(ctx, ids, weights_->token_embedding);
         output_ = core::ensure_backend_addressable_layout(ctx, x).tensor;
         ggml_set_output(output_);
-        mem_.graph = ggml_new_graph_custom(mem_.ctx.get(), 4096, false);
-        ggml_build_forward_expand(mem_.graph, output_);
-        mem_.input_buffer = ggml_backend_alloc_ctx_tensors(mem_.input_ctx.get(), execution_.backend());
-        mem_.gallocr.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(execution_.backend())));
-        if (mem_.input_buffer == nullptr || mem_.gallocr == nullptr ||
-            !ggml_gallocr_reserve(mem_.gallocr.get(), mem_.graph) ||
-            !ggml_gallocr_alloc_graph(mem_.gallocr.get(), mem_.graph)) {
-            mem_.reset(execution_.backend());
-            throw std::runtime_error("failed to allocate Drama 3 backbone token embedding graph");
-        }
+        ggml_build_forward_expand(candidate->graph(), output_);
+        candidate->allocate_persistent();
+        candidate->allocate();
+        prepared_ = std::move(candidate);
         steps_ = steps;
     }
 
@@ -1144,7 +989,7 @@ private:
     std::shared_ptr<const Drama3BackboneWeights> weights_;
     Drama3BackboneDecoderConfig config_;
     size_t graph_arena_bytes_;
-    GraphMemory mem_;
+    std::unique_ptr<core::PreparedGraph> prepared_;
     int64_t steps_ = 0;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * output_ = nullptr;
@@ -1162,39 +1007,31 @@ public:
           config_(config),
           graph_arena_bytes_(graph_arena_bytes) {}
 
-    ~LmHeadGraph() {
-        mem_.reset(execution_.backend());
-    }
-
     std::vector<float> run(const std::vector<float> & hidden) {
         if (static_cast<int64_t>(hidden.size()) != config_.hidden_size) {
             throw std::runtime_error("Drama 3 backbone LM head hidden size mismatch");
         }
         ensure();
         core::write_tensor_f32(core::wrap_tensor(input_, core::TensorShape::from_dims({1, 1, config_.hidden_size})), hidden);
-        if (core::compute_backend_graph(execution_.backend(), mem_.graph, nullptr, "drama3_backbone.lm_head") != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("Drama 3 backbone LM head graph compute failed");
-        }
+        prepared_->compute();
         return core::read_tensor_f32(output_);
     }
 
     void release_graph() {
-        mem_.reset(execution_.backend());
+        prepared_.reset();
         input_ = nullptr;
         output_ = nullptr;
     }
 
 private:
     void ensure() {
-        if (mem_.graph != nullptr) {
+        if (prepared_ != nullptr) {
             return;
         }
-        ggml_init_params params{graph_arena_bytes_, nullptr, true};
-        mem_.ctx.reset(ggml_init(params));
-        ggml_init_params input_params{8ull * 1024ull * 1024ull, nullptr, true};
-        mem_.input_ctx.reset(ggml_init(input_params));
-        core::ModuleBuildContext ctx{mem_.ctx.get(), "drama3_backbone.lm_head", execution_.backend_type()};
-        core::ModuleBuildContext input_ctx{mem_.input_ctx.get(), "drama3_backbone.lm_head.inputs", execution_.backend_type()};
+        auto candidate = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+            "drama3_backbone.lm_head", graph_arena_bytes_, 4096, 8ull * 1024ull * 1024ull});
+        auto & ctx = candidate->build_context();
+        auto & input_ctx = candidate->persistent_build_context();
         auto x = core::make_tensor(input_ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, 1, config_.hidden_size}));
         input_ = x.tensor;
         ggml_set_input(input_);
@@ -1225,23 +1062,17 @@ private:
         }
         output_ = core::ensure_backend_addressable_layout(ctx, x).tensor;
         ggml_set_output(output_);
-        mem_.graph = ggml_new_graph_custom(mem_.ctx.get(), 4096, false);
-        ggml_build_forward_expand(mem_.graph, output_);
-        mem_.input_buffer = ggml_backend_alloc_ctx_tensors(mem_.input_ctx.get(), execution_.backend());
-        mem_.gallocr.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(execution_.backend())));
-        if (mem_.input_buffer == nullptr || mem_.gallocr == nullptr ||
-            !ggml_gallocr_reserve(mem_.gallocr.get(), mem_.graph) ||
-            !ggml_gallocr_alloc_graph(mem_.gallocr.get(), mem_.graph)) {
-            mem_.reset(execution_.backend());
-            throw std::runtime_error("failed to allocate Drama 3 backbone LM head graph");
-        }
+        ggml_build_forward_expand(candidate->graph(), output_);
+        candidate->allocate_persistent();
+        candidate->allocate();
+        prepared_ = std::move(candidate);
     }
 
     core::ExecutionContext & execution_;
     std::shared_ptr<const Drama3BackboneWeights> weights_;
     Drama3BackboneDecoderConfig config_;
     size_t graph_arena_bytes_;
-    GraphMemory mem_;
+    std::unique_ptr<core::PreparedGraph> prepared_;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * output_ = nullptr;
 };
@@ -1260,38 +1091,32 @@ public:
         const size_t small_bytes = ggml_graph_overhead_custom(small_nodes, false) + 64 * ggml_tensor_overhead();
         const size_t layer_bytes =
             ggml_graph_overhead_custom(nodes, false) + 512 * ggml_tensor_overhead() + small_bytes;
-        context_.reset(ggml_init({weights.layers.size() * layer_bytes + 2 * small_bytes, nullptr, true}));
-        inputs_.reset(ggml_init({4 * 1024 * 1024, nullptr, true}));
-        if (!context_ || !inputs_)
-            throw std::runtime_error("cannot allocate Drama 3 offload prefill contexts");
-        auto * persistent = inputs_.get();
+        prepared_ = std::make_unique<core::PreparedGraph>(execution, core::PreparedGraphConfig{
+            "drama3_backbone.offload_prefill", weights.layers.size() * layer_bytes + 2 * small_bytes,
+            nodes, 4 * 1024 * 1024});
+        auto * persistent = prepared_->persistent_build_context().ggml;
         const auto h = config.hidden_size;
         const auto k = config.experts_per_token;
         x_ = ggml_new_tensor_3d(persistent, GGML_TYPE_F32, h, steps, 1);
-        hidden_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, steps);
         residual_ = ggml_new_tensor_3d(persistent, GGML_TYPE_F32, h, steps, 1);
         shared_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, steps);
-        scales_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, k, steps);
-        ids_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, k, steps);
-        const auto rows = expert_rows * config.expert_cache_size;
-        expert_output_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, k * steps + rows);
-        source_rows_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, rows);
-        target_rows_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, rows);
-        expert_slot_ids_ = ggml_new_tensor_2d(persistent, GGML_TYPE_I32, 1, rows);
+        modules::StagedMoeConfig staged_config;
+        staged_config.hidden_size = h;
+        staged_config.tokens = steps;
+        staged_config.selected = k;
+        staged_config.experts = config.experts;
+        staged_config.cache_slots = config.moe.cache_slots;
+        staged_config.rows_per_expert = {32};
+        staged_config.scatter_index_type = GGML_TYPE_I32;
+        workspace_ = std::make_shared<core::GraphWorkspace>(execution.backend());
+        staged_moe_ = std::make_unique<modules::StagedMoeRuntime>(execution, std::move(staged_config), workspace_, weights.experts->cpu_execution());
+        hidden_ = staged_moe_->hidden_input();
         positions_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, steps);
         mask_ = ggml_new_tensor_4d(persistent, GGML_TYPE_F16, steps, steps, 1, 1);
-        for (auto * tensor : {x_, hidden_, residual_, shared_, scales_, ids_, expert_output_, source_rows_,
-                              target_rows_, expert_slot_ids_, positions_, mask_})
+        for (auto * tensor : {x_, residual_, shared_, positions_, mask_})
             ggml_set_input(tensor);
-        buffer_.reset(ggml_backend_alloc_ctx_tensors(persistent, execution.backend()));
-        if (!buffer_)
-            throw std::runtime_error("cannot allocate Drama 3 offload prefill inputs");
-        // Padded expert lanes must never read uninitialized values.
-        ggml_backend_buffer_clear(buffer_.get(), 0);
-        std::vector<int32_t> slot_ids(static_cast<size_t>(rows));
-        for (int64_t slot = 0; slot < config.expert_cache_size; ++slot)
-            std::fill_n(slot_ids.begin() + slot * expert_rows, expert_rows, static_cast<int32_t>(slot));
-        ggml_backend_tensor_set(expert_slot_ids_, slot_ids.data(), 0, slot_ids.size() * sizeof(int32_t));
+        prepared_->allocate_persistent();
+        prepared_->clear_persistent();
         std::vector<int32_t> positions(static_cast<size_t>(steps));
         std::vector<ggml_fp16_t> mask(static_cast<size_t>(steps * steps));
         for (int64_t row = 0; row < steps; ++row) {
@@ -1302,26 +1127,14 @@ public:
         }
         ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
         ggml_backend_tensor_set(mask_, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-        core::ModuleBuildContext ctx{context_.get(), "drama3_backbone.offload_prefill", execution.backend_type()};
+        auto & ctx = prepared_->build_context();
         const auto shape = core::TensorShape::from_dims({1, steps, h});
         auto x = core::wrap_tensor(x_, shape);
-        auto * largest = static_cast<ggml_cgraph *>(nullptr);
-        size_t max_bytes = 0;
-        allocator_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(execution.backend())));
-        if (!allocator_)
-            throw std::runtime_error("cannot allocate Drama 3 offload prefill planner");
-        auto add_graph = [&](ggml_cgraph * graph) {
-            size_t bytes = 0;
-            ggml_gallocr_reserve_n_size(allocator_.get(), graph, nullptr, nullptr, &bytes);
-            if (!largest || bytes > max_bytes) {
-                largest = graph;
-                max_bytes = bytes;
-            }
-            graphs_.push_back(graph);
-        };
         size_t full = 0, linear = 0;
         for (const auto & layer : weights.layers) {
-            auto * graph = ggml_new_graph_custom(ctx.ggml, nodes, false);
+            const auto id = attention_graphs_.empty() ? size_t{0}
+                : prepared_->add_graph("layer_" + std::to_string(attention_graphs_.size()), nodes);
+            auto * graph = prepared_->graph(id);
             const auto positions = core::wrap_tensor(positions_, core::TensorShape::from_dims({steps}), GGML_TYPE_I32);
             const auto mask =
                 core::wrap_tensor(mask_, core::TensorShape::from_dims({1, 1, steps, steps}), GGML_TYPE_F16);
@@ -1353,76 +1166,41 @@ public:
                                   .build(ctx, residual, layer.post_norm);
             normalized = round_activation(ctx, normalized, config);
             const auto moe = build_moe_inputs(ctx, normalized, layer, config);
+            staged_moe_->build_inputs(ctx, graph, normalized.tensor, {moe.ids, moe.scales});
             for (const auto & copy : std::vector<std::pair<ggml_tensor *, ggml_tensor *>>{
                      {residual.tensor, residual_},
-                     {normalized.tensor, hidden_},
-                     {moe.shared, shared_},
-                     {moe.scales, scales_},
-                     {ggml_cast(ctx.ggml, moe.ids, GGML_TYPE_F32), ids_}}) {
+                     {moe.shared, shared_}}) {
                 auto * destination = ggml_reshape_2d(ctx.ggml, copy.second, copy.second->ne[0], steps);
                 auto * source = ggml_reshape_2d(ctx.ggml, copy.first, copy.first->ne[0], steps);
                 ggml_build_forward_expand(graph, ggml_cpy(ctx.ggml, source, destination));
             }
-            add_graph(graph);
-            attention_graphs_.push_back(graph);
+            attention_graphs_.push_back(id);
             if (layer.full_attention)
                 ++full;
             else
                 ++linear;
 
-            {
-                const int64_t block_rows = expert_rows;
-                const int64_t rows = block_rows * config.expert_cache_size;
-                graph = ggml_new_graph_custom(ctx.ggml, small_nodes, false);
-                auto * source_rows = ggml_view_1d(ctx.ggml, source_rows_, rows, 0);
-                auto * target_rows = ggml_view_1d(ctx.ggml, target_rows_, rows, 0);
-                auto * input = ggml_reshape_3d(ctx.ggml, ggml_get_rows(ctx.ggml, hidden_, source_rows), h, 1, rows);
-                // Preserve the resident indexed-MoE arithmetic. Generic batched
-                // GEMMs select different quantized activation paths on CUDA.
-                auto * gate = ggml_mul_mat_id(ctx.ggml, layer.expert_gate.tensor, input, expert_slot_ids_);
-                auto * up = ggml_mul_mat_id(ctx.ggml, layer.expert_up.tensor, input, expert_slot_ids_);
-                auto * activated = ggml_mul(ctx.ggml, ggml_silu(ctx.ggml, gate), up);
-                auto * output = ggml_mul_mat_id(ctx.ggml, layer.expert_down.tensor, activated, expert_slot_ids_);
-                ggml_build_forward_expand(
-                    graph,
-                    ggml_set_rows(ctx.ggml, expert_output_, ggml_reshape_2d(ctx.ggml, output, h, rows), target_rows));
-                add_graph(graph);
-                expert_graphs_.push_back(graph);
-            }
+            staged_moe_->add_layer(modules::MoeModule{},
+                {layer.expert_up.tensor, layer.expert_gate.tensor, layer.expert_down.tensor},
+                *layer.disk_store, layer.disk_group);
         }
-        finish_ = ggml_new_graph_custom(ctx.ggml, small_nodes, false);
-        auto * experts =
-            ggml_view_3d(ctx.ggml, expert_output_, h, k, steps, h * sizeof(float), h * k * sizeof(float), 0);
-        auto * scaled = ggml_mul(ctx.ggml, experts, ggml_reshape_3d(ctx.ggml, scales_, 1, k, steps));
-        auto * reduced = ggml_cont(ctx.ggml, ggml_permute(ctx.ggml, scaled, 1, 0, 2, 3));
-        reduced = ggml_reshape_2d(ctx.ggml, ggml_sum_rows(ctx.ggml, reduced), h, steps);
+
+        finish_ = prepared_->add_graph("finish", small_nodes);
+        auto * reduced = modules::MoeModule::combine(ctx, staged_moe_->output(), staged_moe_->routing_weights());
         auto combined =
             core::wrap_tensor(ggml_reshape_3d(ctx.ggml, ggml_add(ctx.ggml, reduced, shared_), h, steps, 1), shape);
         combined = round_activation(ctx, combined, config);
         combined = round_activation(ctx, modules::AddModule{}.build(ctx, core::wrap_tensor(residual_, shape), combined),
                                     config);
-        ggml_build_forward_expand(finish_, ggml_cpy(ctx.ggml, combined.tensor, x_));
-        add_graph(finish_);
-        final_ = ggml_new_graph_custom(ctx.ggml, small_nodes, false);
+        ggml_build_forward_expand(prepared_->graph(finish_), ggml_cpy(ctx.ggml, combined.tensor, x_));
+        final_ = prepared_->add_graph("final", small_nodes);
         auto normalized =
             modules::RMSNormModule({h, config.rms_norm_eps, true, false}).build(ctx, x, weights.final_norm);
         normalized = round_activation(ctx, normalized, config);
-        ggml_build_forward_expand(final_, ggml_cpy(ctx.ggml, normalized.tensor, hidden_));
-        add_graph(final_);
-        // All phases execute serially and share one activation workspace. Plan
-        // the largest first so cached graph addresses never move afterward.
-        if (!ggml_gallocr_reserve(allocator_.get(), largest))
-            throw std::runtime_error("cannot reserve Drama 3 offload prefill workspace");
-        for (auto * graph : graphs_) {
-            if (!ggml_gallocr_reserve(allocator_.get(), graph) || !ggml_gallocr_alloc_graph(allocator_.get(), graph))
-                throw std::runtime_error("cannot allocate Drama 3 offload prefill graph");
-            core::prepare_host_graph_plan(execution_, graph, plans_[graph]);
-        }
-    }
-
-    ~Drama3OffloadPrefillGraph() {
-        for (auto * graph : graphs_)
-            core::release_backend_graph_resources(execution_.backend(), graph, true);
+        ggml_build_forward_expand(prepared_->graph(final_), ggml_cpy(ctx.ggml, normalized.tensor, hidden_));
+        workspace_->add(*prepared_);
+        workspace_->prepare();
+        staged_moe_->prepare();
     }
 
     int64_t steps() const noexcept { return steps_; }
@@ -1430,64 +1208,18 @@ public:
     Drama3BackboneDecoderForwardResult run(const std::vector<float> & embeddings, int64_t steps) {
         ggml_backend_tensor_set(x_, embeddings.data(), 0, embeddings.size() * sizeof(float));
         const auto k = config_.experts_per_token;
-        std::vector<float> ids(static_cast<size_t>(steps * k));
-        std::vector<std::vector<int32_t>> by_expert(static_cast<size_t>(config_.experts));
-        const auto rows = expert_rows * config_.expert_cache_size;
-        std::vector<int32_t> source(static_cast<size_t>(rows)), target(static_cast<size_t>(rows));
         double attention_ms = 0, expert_ms = 0;
         uint64_t expert_work_rows = 0;
         for (size_t layer = 0; layer < weights_.layers.size(); ++layer) {
             auto started = std::chrono::steady_clock::now();
-            compute(attention_graphs_[layer]);
+            prepared_->compute(attention_graphs_[layer]);
             attention_ms += debug::elapsed_ms(started);
             started = std::chrono::steady_clock::now();
-            ggml_backend_tensor_get(ids_, ids.data(), 0, ids.size() * sizeof(float));
-            for (auto & rows : by_expert)
-                rows.clear();
-            for (size_t pair = 0; pair < ids.size(); ++pair)
-                by_expert.at(static_cast<size_t>(ids[pair])).push_back(static_cast<int32_t>(pair));
-            std::vector<int32_t> experts;
-            for (int32_t expert = 0; expert < config_.experts; ++expert)
-                if (!by_expert[expert].empty())
-                    experts.push_back(expert);
-            // Similar row counts share a block, avoiding sparse experts being
-            // padded to the busiest expert's row count in an unrelated group.
-            std::stable_sort(experts.begin(), experts.end(), [&](int32_t left, int32_t right) {
-                return by_expert[left].size() > by_expert[right].size();
-            });
-            const auto & weights = weights_.layers[layer];
-            for (size_t start = 0; start < experts.size(); start += static_cast<size_t>(config_.expert_cache_size)) {
-                const auto end = std::min(experts.size(), start + static_cast<size_t>(config_.expert_cache_size));
-                const std::vector<int32_t> group(experts.begin() + start, experts.begin() + end);
-                const auto mapped = weights.disk_store->stage(weights.disk_group, group);
-                size_t maximum = 0;
-                for (const auto expert : group)
-                    maximum = std::max(maximum, by_expert[expert].size());
-                for (size_t begin = 0; begin < maximum;) {
-                    const size_t block_rows = expert_rows;
-                    const size_t work_rows = block_rows * config_.expert_cache_size;
-                    std::fill_n(source.begin(), work_rows, 0);
-                    for (size_t row = 0; row < work_rows; ++row)
-                        target[row] = static_cast<int32_t>(steps_ * k + row);
-                    for (size_t e = 0; e < group.size(); ++e) {
-                        const auto & pairs = by_expert[group[e]];
-                        for (size_t row = begin; row < std::min(pairs.size(), begin + block_rows); ++row) {
-                            const auto slot_row = static_cast<size_t>(mapped[e]) * block_rows + row - begin;
-                            source[slot_row] = static_cast<int32_t>(pairs[row] / k);
-                            target[slot_row] = pairs[row];
-                        }
-                    }
-                    ggml_backend_tensor_set(source_rows_, source.data(), 0, work_rows * sizeof(int32_t));
-                    ggml_backend_tensor_set(target_rows_, target.data(), 0, work_rows * sizeof(int32_t));
-                    compute(expert_graphs_[layer]);
-                    expert_work_rows += work_rows;
-                    begin += block_rows;
-                }
-            }
-            compute(finish_);
+            expert_work_rows += staged_moe_->run(layer);
+            prepared_->compute(finish_);
             expert_ms += debug::elapsed_ms(started);
         }
-        compute(final_);
+        prepared_->compute(final_);
         Drama3BackboneDecoderForwardResult result;
         result.steps = steps;
         result.hidden.resize(embeddings.size());
@@ -1500,39 +1232,21 @@ public:
     }
 
 private:
-    void compute(ggml_cgraph * graph) {
-        if (core::compute_graph(execution_, graph, plans_.at(graph), "drama3_backbone.offload_prefill") !=
-            GGML_STATUS_SUCCESS)
-            throw std::runtime_error("Drama 3 offload prefill graph compute failed");
-    }
-    static constexpr size_t expert_rows = 32;
     core::ExecutionContext & execution_;
     const Drama3BackboneWeights & weights_;
     Drama3BackboneDecoderConfig config_;
     int64_t steps_;
-    std::unique_ptr<ggml_context, GgmlContextDeleter> context_;
-    std::unique_ptr<ggml_context, GgmlContextDeleter> inputs_;
-    std::unique_ptr<std::remove_pointer_t<ggml_backend_buffer_t>, decltype(&ggml_backend_buffer_free)> buffer_{
-        nullptr, ggml_backend_buffer_free};
-    std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> allocator_;
-    std::vector<ggml_cgraph *> graphs_;
-    std::vector<ggml_cgraph *> attention_graphs_;
-    std::vector<ggml_cgraph *> expert_graphs_;
-    ggml_cgraph * finish_ = nullptr;
-    ggml_cgraph * final_ = nullptr;
+    std::shared_ptr<core::GraphWorkspace> workspace_;
+    std::vector<core::PreparedGraph::GraphId> attention_graphs_;
+    std::unique_ptr<modules::StagedMoeRuntime> staged_moe_;
+    std::unique_ptr<core::PreparedGraph> prepared_;
+    core::PreparedGraph::GraphId finish_ = 0, final_ = 0;
     ggml_tensor * x_ = nullptr;
     ggml_tensor * hidden_ = nullptr;
     ggml_tensor * residual_ = nullptr;
     ggml_tensor * shared_ = nullptr;
-    ggml_tensor * scales_ = nullptr;
-    ggml_tensor * ids_ = nullptr;
-    ggml_tensor * expert_output_ = nullptr;
-    ggml_tensor * source_rows_ = nullptr;
-    ggml_tensor * target_rows_ = nullptr;
-    ggml_tensor * expert_slot_ids_ = nullptr;
     ggml_tensor * positions_ = nullptr;
     ggml_tensor * mask_ = nullptr;
-    std::map<ggml_cgraph *, core::HostGraphPlan> plans_;
 };
 
 class Drama3BackboneCachedDecodeGraph {
@@ -1553,12 +1267,9 @@ public:
         if (cache_steps_ <= 0) {
             throw std::runtime_error("Drama 3 backbone cached decode requires positive cache length");
         }
-        ggml_init_params params{graph_arena_bytes, nullptr, true};
-        ctx_.reset(ggml_init(params));
-        if (ctx_ == nullptr) {
-            throw std::runtime_error("failed to initialize Drama 3 backbone cached decode graph context");
-        }
-        core::ModuleBuildContext ctx{ctx_.get(), "drama3_backbone.cached_decode", execution_.backend_type()};
+        decode_prepared_ = std::make_unique<core::PreparedGraph>(execution_,
+            core::PreparedGraphConfig{"drama3_backbone.cached_decode", graph_arena_bytes, 65536});
+        auto & ctx = decode_prepared_->build_context();
         // Preserve Vulkan fusion boundaries; eliding these views changes sampled output there.
         ctx.elide_identity_reshapes = execution_.backend_type() == core::BackendType::Cuda;
         ggml_init_params persistent_params{4 * 1024 * 1024, nullptr, true};
@@ -1609,10 +1320,10 @@ public:
         buffer_.reset(ggml_backend_alloc_ctx_tensors(persistent_ctx_.get(), execution_.backend()));
         if (buffer_ == nullptr) throw std::runtime_error("failed to allocate Drama 3 backbone cached decode graph");
         if (config_.kv_cache_alignment == 1) {
+            graph_ = decode_prepared_->graph();
             build_decode(ctx, cache_steps_, graph_, output_);
-            if (!decode_allocator_.allocate(graph_, execution_.backend(),
-                    weights_->cpu_execution ? weights_->cpu_execution->backend() : nullptr, weights_->disk_store.get()))
-                throw std::runtime_error("failed to allocate Drama 3 backbone cached decode graph");
+            weights_->experts->configure_scheduler(*decode_prepared_);
+            decode_prepared_->allocate();
         }
         attention_mask_values_.assign(static_cast<size_t>(cache_steps_), ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
         reset();
@@ -1625,7 +1336,6 @@ public:
         auto * mask = attention_mask_;
         if (steps < cache_steps_) mask = ggml_view_1d(ctx.ggml, mask, steps, 0);
         auto attention_mask = core::wrap_tensor(mask, core::TensorShape::from_dims({1, 1, 1, steps}), GGML_TYPE_F16);
-        graph = ggml_new_graph_custom(ctx.ggml, 65536, false);
         size_t full_index = 0;
         size_t linear_index = 0;
         for (const auto & layer : weights_->layers) {
@@ -1669,8 +1379,7 @@ public:
     ~Drama3BackboneCachedDecodeGraph() {
         release_prefill_graphs();
         decode_buckets_.clear();
-        core::release_backend_graph_resources(execution_.backend(), graph_, true);
-        decode_allocator_.reset();
+        decode_prepared_.reset();
     }
 
     void release_prefill_graphs() {
@@ -1681,7 +1390,7 @@ public:
 
     void reset(bool invalidate_experts = false) {
         valid_steps_ = 0;
-        if (invalidate_experts && weights_->disk_store) weights_->disk_store->invalidate_cache();
+        if (invalidate_experts && weights_->experts->disk_store()) weights_->experts->disk_store()->invalidate_cache();
         // Masked attention can still multiply a zero probability by a cached
         // value. Initialize KV as well as recurrent state to avoid NaNs from
         // uninitialized storage on the first request.
@@ -1703,9 +1412,9 @@ public:
         if (steps > cache_steps_) {
             throw std::runtime_error("Drama 3 backbone prefill exceeds cache length");
         }
-        if (weights_->disk_store) {
+        if (weights_->experts->disk_store()) {
             reset();
-            if (!weights_->cpu_execution || config_.cpu_expert_layers == 0) {
+            if (core::is_host_backend(execution_.backend()) || !weights_->experts->has_cpu_layers()) {
                 if (!offload_prefill_ || offload_prefill_->steps() != steps) {
                     offload_prefill_.reset();
                     offload_prefill_ = std::make_unique<Drama3OffloadPrefillGraph>(
@@ -1728,9 +1437,7 @@ public:
         }
         auto & prefill = ensure_prefill(steps);
         core::write_tensor_f32(core::wrap_tensor(prefill.input, core::TensorShape::from_dims({1, steps, config_.hidden_size})), embeddings);
-        if (prefill.memory.hybrid.compute(execution_.backend(), prefill.memory.graph, "drama3_backbone.prefill") != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("Drama 3 backbone prefill graph compute failed");
-        }
+        prefill.prepared->compute();
         Drama3BackboneDecoderForwardResult out;
         out.steps = steps;
         out.hidden = core::read_tensor_f32(prefill.output);
@@ -1759,9 +1466,8 @@ public:
             cache_steps_,
             valid_steps_,
             valid_steps_);
-        auto * active_graph = graph_;
+        auto * active = decode_prepared_.get();
         auto * active_output = output_;
-        auto * allocator = &decode_allocator_;
         if (config_.kv_cache_alignment > 1) {
             const int64_t alignment = config_.kv_cache_alignment;
             const int64_t steps = std::min(cache_steps_, ((valid_steps_ / alignment) + 1) * alignment);
@@ -1769,26 +1475,22 @@ public:
                 [steps](const auto & bucket) { return bucket->steps == steps; });
             if (found == decode_buckets_.end()) {
                 auto bucket = std::make_unique<DecodeBucket>();
-                bucket->backend = execution_.backend();
                 bucket->steps = steps;
-                bucket->memory.ctx.reset(ggml_init({graph_arena_bytes_, nullptr, true}));
-                if (!bucket->memory.ctx) throw std::runtime_error("failed to initialize Drama 3 attention bucket");
-                core::ModuleBuildContext ctx{bucket->memory.ctx.get(), "drama3_backbone.cached_decode", execution_.backend_type()};
+                bucket->prepared = std::make_unique<core::PreparedGraph>(execution_,
+                    core::PreparedGraphConfig{"drama3_backbone.cached_decode", graph_arena_bytes_, 65536});
+                bucket->graph = bucket->prepared->graph();
+                auto & ctx = bucket->prepared->build_context();
                 ctx.elide_identity_reshapes = execution_.backend_type() == core::BackendType::Cuda;
-                build_decode(ctx, steps, bucket->memory.graph, bucket->output);
-                if (!bucket->memory.hybrid.allocate(bucket->memory.graph, execution_.backend(),
-                        weights_->cpu_execution ? weights_->cpu_execution->backend() : nullptr, weights_->disk_store.get()))
-                    throw std::runtime_error("failed to allocate Drama 3 attention bucket");
+                build_decode(ctx, steps, bucket->graph, bucket->output);
+                weights_->experts->configure_scheduler(*bucket->prepared);
+                bucket->prepared->allocate();
                 decode_buckets_.push_back(std::move(bucket));
                 found = std::prev(decode_buckets_.end());
             }
-            active_graph = (*found)->memory.graph;
+            active = (*found)->prepared.get();
             active_output = (*found)->output;
-            allocator = &(*found)->memory.hybrid;
         }
-        if (allocator->compute(execution_.backend(), active_graph, "drama3_backbone.cached_decode") != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("Drama 3 backbone cached decode graph compute failed");
-        }
+        active->compute();
         std::vector<float> hidden(static_cast<size_t>(config_.hidden_size));
         ggml_backend_tensor_get(active_output, hidden.data(), 0, hidden.size() * sizeof(float));
         ++valid_steps_;
@@ -1797,23 +1499,21 @@ public:
 
 private:
     struct DecodeBucket {
-        GraphMemory memory;
-        ggml_backend_t backend = nullptr;
+        std::unique_ptr<core::PreparedGraph> prepared;
+        ggml_cgraph * graph = nullptr;
         int64_t steps = 0;
         ggml_tensor * output = nullptr;
-        ~DecodeBucket() { memory.reset(backend); }
     };
 
     struct PrefillGraph {
-        GraphMemory memory;
-        ggml_backend_t backend = nullptr;
+        std::unique_ptr<core::PreparedGraph> prepared;
+        ggml_cgraph * graph = nullptr;
         int64_t steps = 0;
         size_t bytes = 0;
         ggml_tensor * input = nullptr;
         ggml_tensor * positions = nullptr;
         ggml_tensor * attention_mask = nullptr;
         ggml_tensor * output = nullptr;
-        ~PrefillGraph() { memory.reset(backend); }
     };
 
     PrefillGraph & ensure_prefill(int64_t steps) {
@@ -1832,28 +1532,25 @@ private:
         }
         auto built = std::make_unique<PrefillGraph>();
         auto & prefill = *built;
-        prefill.backend = execution_.backend();
         prefill.steps = steps;
-        ggml_init_params params{128ull * 1024ull * 1024ull, nullptr, true};
-        prefill.memory.ctx.reset(ggml_init(params));
-        ggml_init_params input_params{32ull * 1024ull * 1024ull, nullptr, true};
-        prefill.memory.input_ctx.reset(ggml_init(input_params));
-        core::ModuleBuildContext ctx{prefill.memory.ctx.get(), "drama3_backbone.prefill", execution_.backend_type()};
-        core::ModuleBuildContext input_ctx{prefill.memory.input_ctx.get(), "drama3_backbone.prefill.inputs", execution_.backend_type()};
+        prefill.prepared = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+            "drama3_backbone.prefill", 128ull * 1024ull * 1024ull, 65536, 32ull * 1024ull * 1024ull});
+        auto & ctx = prefill.prepared->build_context();
+        auto & input_ctx = prefill.prepared->persistent_build_context();
         auto x = core::make_tensor(input_ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, steps, config_.hidden_size}));
         prefill.input = x.tensor;
         ggml_set_input(prefill.input);
         auto positions = core::make_tensor(input_ctx, GGML_TYPE_I32, core::TensorShape::from_dims({steps}));
         prefill.positions = positions.tensor;
         ggml_set_input(prefill.positions);
-        prefill.attention_mask = ggml_new_tensor_4d(prefill.memory.input_ctx.get(), GGML_TYPE_F16, steps, steps, 1, 1);
+        prefill.attention_mask = ggml_new_tensor_4d(input_ctx.ggml, GGML_TYPE_F16, steps, steps, 1, 1);
         ggml_set_input(prefill.attention_mask);
         auto attention_mask = core::wrap_tensor(
             prefill.attention_mask,
             core::TensorShape::from_dims({1, 1, steps, steps}),
             GGML_TYPE_F16);
 
-        prefill.memory.graph = ggml_new_graph_custom(prefill.memory.ctx.get(), 65536, false);
+        prefill.graph = prefill.prepared->graph();
         const int64_t state_values = config_.linear_value_head_dim * config_.linear_value_head_dim * config_.linear_num_value_heads;
         const int64_t full_count = static_cast<int64_t>(full_key_caches_.size());
         const int64_t linear_count = static_cast<int64_t>(linear_recurrent_states_.size());
@@ -1869,7 +1566,7 @@ private:
                 }
                 h = full_attention_prefill_cached(
                     ctx,
-                    prefill.memory.graph,
+                    prefill.graph,
                     h,
                     positions,
                     attention_mask,
@@ -1891,10 +1588,10 @@ private:
                 auto state = core::wrap_tensor(prefill_zero_state_, core::TensorShape::from_dims({1, 1, state_values}));
                 auto out = linear_attention_prefill(ctx, h, state, *layer.linear, config_);
                 ggml_build_forward_expand(
-                    prefill.memory.graph,
+                    prefill.graph,
                     ggml_cpy(ctx.ggml, out.next_conv_tail.tensor, linear_conv_tails_[static_cast<size_t>(linear_index)]));
                 ggml_build_forward_expand(
-                    prefill.memory.graph,
+                    prefill.graph,
                     ggml_cpy(ctx.ggml, out.next_recurrent_state.tensor, linear_recurrent_states_[static_cast<size_t>(linear_index)]));
                 h = std::move(out.output);
                 ++linear_index;
@@ -1915,18 +1612,15 @@ private:
         x = round_activation(ctx, x, config_);
         prefill.output = core::ensure_backend_addressable_layout(ctx, x).tensor;
         ggml_set_output(prefill.output);
-        ggml_build_forward_expand(prefill.memory.graph, prefill.output);
-        prefill.memory.input_buffer = ggml_backend_alloc_ctx_tensors(prefill.memory.input_ctx.get(), execution_.backend());
-        if (prefill.memory.input_buffer == nullptr || !prefill.memory.hybrid.allocate(prefill.memory.graph, execution_.backend(),
-                weights_->cpu_execution ? weights_->cpu_execution->backend() : nullptr, weights_->disk_store.get())) {
-            prefill.memory.reset(execution_.backend());
-            throw std::runtime_error("failed to allocate Drama 3 backbone prefill graph");
-        }
+        ggml_build_forward_expand(prefill.graph, prefill.output);
+        prefill.prepared->allocate_persistent();
+        weights_->experts->configure_scheduler(*prefill.prepared);
+        prefill.prepared->allocate();
         const auto pos = position_ids(steps);
         ggml_backend_tensor_set(prefill.positions, pos.data(), 0, pos.size() * sizeof(int32_t));
         const auto mask = modules::causal_prefill_mask_values(1, steps);
         ggml_backend_tensor_set(prefill.attention_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-        prefill.bytes = prefill.memory.hybrid.buffer_bytes() + ggml_backend_buffer_get_size(prefill.memory.input_buffer);
+        prefill.bytes = prefill.prepared->workspace_bytes() + prefill.prepared->persistent_bytes();
         // Retain at most eight shapes within the budget. One active graph is
         // required even when its working set exceeds the cache budget.
         while (!prefill_graphs_.empty() &&
@@ -1939,7 +1633,7 @@ private:
         if (config_.profile_prefill_cache) {
             std::fprintf(stderr, "[drama3.prefill_cache] rows=%lld graph_mib=%.1f retained_mib=%.1f shapes=%zu nodes=%d\n",
                 static_cast<long long>(steps), prefill.bytes / 1048576.0,
-                prefill_cached_bytes_ / 1048576.0, prefill_graphs_.size(), ggml_graph_n_nodes(prefill.memory.graph));
+                prefill_cached_bytes_ / 1048576.0, prefill_graphs_.size(), ggml_graph_n_nodes(prefill.graph));
         }
         return *prefill_graphs_.front();
     }
@@ -1950,13 +1644,12 @@ private:
     int64_t cache_steps_ = 0;
     int64_t valid_steps_ = 0;
     size_t graph_arena_bytes_ = 0;
-    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
     std::unique_ptr<ggml_context, GgmlContextDeleter> persistent_ctx_;
     // Also owns the buffer when construction fails. Destroy the allocator first,
     // while its graph, tensors, and persistent buffer are still alive.
     std::unique_ptr<std::remove_pointer_t<ggml_backend_buffer_t>, decltype(&ggml_backend_buffer_free)>
         buffer_{nullptr, ggml_backend_buffer_free};
-    HybridGraphAllocator decode_allocator_;
+    std::unique_ptr<core::PreparedGraph> decode_prepared_;
     std::vector<std::unique_ptr<DecodeBucket>> decode_buckets_;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * positions_ = nullptr;
@@ -1998,7 +1691,7 @@ public:
     }
 
     Drama3BackboneDecoderForwardResult forward_embeddings(const std::vector<float> & embeddings, int64_t steps) {
-        if (weights_->disk_store) return decode_graph_.prefill_embeddings(embeddings, steps);
+        if (weights_->experts->disk_store()) return decode_graph_.prefill_embeddings(embeddings, steps);
         return forward_.run(embeddings, steps);
     }
 

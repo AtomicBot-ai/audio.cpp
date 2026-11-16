@@ -6,13 +6,19 @@
 #include "engine/framework/modules/linear_module.h"
 
 #include <optional>
+#include <string>
 
 namespace engine::modules {
 
 enum class FeedForwardActivation {
     Gelu,
     Relu,
+    ReluSquared,
 };
+
+// Autocast uses BF16 operands, or native F16 intermediates on CUDA when F16
+// weights and default accumulation are selected. Autocast output is F32.
+enum class FeedForwardPrecisionPolicy { Native, Bf16Autocast };
 
 struct FeedForwardConfig {
     int64_t hidden_size = 0;
@@ -21,6 +27,11 @@ struct FeedForwardConfig {
     GeluApproximation gelu_approximation = GeluApproximation::ExactErf;
     ggml_prec projection_precision = GGML_PREC_DEFAULT;
     FeedForwardActivation activation = FeedForwardActivation::Gelu;
+    FeedForwardPrecisionPolicy precision_policy = FeedForwardPrecisionPolicy::Native;
+};
+
+struct FeedForwardWeightNames {
+    std::string fc1_weight, fc1_bias, fc2_weight, fc2_bias;
 };
 
 struct FeedForwardWeights {
@@ -50,6 +61,8 @@ struct GatedFeedForwardWeights {
     LinearWeights gate_proj;
     LinearWeights up_proj;
     LinearWeights down_proj;
+    // Optional packed [up, gate] rows, replacing the two input projections.
+    LinearWeights up_gate_proj{};
 };
 
 struct ConvFeedForwardConfig {

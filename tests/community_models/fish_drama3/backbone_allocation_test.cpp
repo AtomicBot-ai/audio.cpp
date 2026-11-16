@@ -1,11 +1,13 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
+#include "ggml-backend-impl.h"
 #include "engine/framework/io/safetensors.h"
 #include "engine/framework/debug/profiler.h"
 
 #include <cmath>
 #include <iostream>
 #include <set>
+#include <map>
 #include <stdexcept>
 #include <random>
 
@@ -14,38 +16,44 @@ bool fail_buffer = false;
 bool fail_graph = false;
 std::set<ggml_backend_buffer_t> live_buffers;
 
-ggml_backend_buffer_t test_alloc_buffer(ggml_context * ctx, ggml_backend_t backend) {
-    if (fail_buffer) return nullptr;
-    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (buffer) live_buffers.insert(buffer);
-    return buffer;
-}
+size_t allocation_calls = 0;
+using FreeBuffer = void (*)(ggml_backend_buffer_t);
+std::map<ggml_backend_buffer_t, FreeBuffer> original_frees;
 
-void test_free_buffer(ggml_backend_buffer_t buffer) {
-    live_buffers.erase(buffer);
-    ggml_backend_buffer_free(buffer);
-}
-
-bool test_alloc_graph(ggml_gallocr_t allocator, ggml_cgraph * graph) {
-    return !fail_graph && ggml_gallocr_alloc_graph(allocator, graph);
-}
-
-bool test_alloc_split_graph(ggml_backend_sched_t scheduler, ggml_cgraph * graph) {
-    return !fail_graph && ggml_backend_sched_alloc_graph(scheduler, graph);
-}
+// Inject failure at the real backend boundary, including allocations made by
+// PreparedGraph. The first allocation is persistent state; later ones are scratch.
+class AllocationFailures {
+public:
+    explicit AllocationFailures(ggml_backend_t backend)
+        : type_(ggml_backend_get_default_buffer_type(backend)), original_(type_->iface.alloc_buffer) {
+        active_ = this;
+        type_->iface.alloc_buffer = [](ggml_backend_buffer_type_t type, size_t bytes) {
+            const auto call = allocation_calls++;
+            if (fail_buffer || (fail_graph && call > 0)) return ggml_backend_buffer_t{nullptr};
+            auto * buffer = active_->original_(type, bytes);
+            if (buffer) {
+                live_buffers.insert(buffer);
+                original_frees.emplace(buffer, buffer->iface.free_buffer);
+                buffer->iface.free_buffer = [](ggml_backend_buffer_t value) {
+                    const auto original = original_frees.at(value);
+                    original_frees.erase(value);
+                    live_buffers.erase(value);
+                    if (original) original(value);
+                };
+            }
+            return buffer;
+        };
+    }
+    ~AllocationFailures() { type_->iface.alloc_buffer = original_; active_ = nullptr; }
+private:
+    ggml_backend_buffer_type_t type_;
+    ggml_backend_buffer_t (*original_)(ggml_backend_buffer_type_t, size_t);
+    static AllocationFailures * active_;
+};
+AllocationFailures * AllocationFailures::active_ = nullptr;
 }  // namespace
 
-// Compile the model's actual constructor with allocation failures injected only
-// into this test. This avoids production fault hooks or changes to GGML.
-#define ggml_backend_alloc_ctx_tensors test_alloc_buffer
-#define ggml_backend_buffer_free test_free_buffer
-#define ggml_gallocr_alloc_graph test_alloc_graph
-#define ggml_backend_sched_alloc_graph test_alloc_split_graph
 #include "../../../src/community_models/fish_drama3/backbone.cpp"
-#undef ggml_backend_alloc_ctx_tensors
-#undef ggml_backend_buffer_free
-#undef ggml_gallocr_alloc_graph
-#undef ggml_backend_sched_alloc_graph
 
 int main(int argc, char ** argv) {
     try {
@@ -53,11 +61,25 @@ int main(int argc, char ** argv) {
         engine::core::BackendConfig backend;
         backend.threads = 1;
         engine::core::ExecutionContext execution(backend);
+        struct FixtureDirectory {
+            std::filesystem::path path = std::filesystem::temp_directory_path() /
+                ("drama3_prefill_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            FixtureDirectory() { std::filesystem::create_directories(path); }
+            ~FixtureDirectory() { std::error_code error; std::filesystem::remove_all(path, error); }
+        } fixture;
         std::unique_ptr<ggml_context, drama::GgmlContextDeleter> context(
             ggml_init({1024 * 1024, nullptr, false}));
         if (!context) throw std::runtime_error("test weight context allocation failed");
         auto * norm = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 16);
         std::fill_n(static_cast<float *>(norm->data), 16, 1.0F);
+        const auto norm_safe = fixture.path / "allocation.safetensors";
+        const auto norm_gguf = fixture.path / "allocation.gguf";
+        std::vector<unsigned char> norm_bytes(16 * sizeof(float));
+        std::memcpy(norm_bytes.data(), norm->data, norm_bytes.size());
+        engine::io::write_safetensors_file(norm_safe, {{"norm", "F32", {16}, std::move(norm_bytes)}});
+        engine::assets::convert_tensor_sources_to_gguf({{norm_safe, ""}}, norm_gguf,
+            engine::assets::TensorStorageType::F32, true, false, {}, {}, std::nullopt);
+        auto norm_source = engine::assets::open_tensor_source(norm_gguf);
         auto weights = std::make_shared<drama::Drama3BackboneWeights>();
         weights->final_norm.weight = engine::core::wrap_tensor(
             norm, engine::core::TensorShape::from_dims({16}), GGML_TYPE_F32);
@@ -67,18 +89,30 @@ int main(int argc, char ** argv) {
         config.linear_key_head_dim = config.linear_value_head_dim = 4;
         config.linear_num_key_heads = config.linear_num_value_heads = 1;
 
-        int failures = 0;
+        int failures = 0, head_recoveries = 0;
+        {
+        AllocationFailures injection(execution.backend());
         for (bool split : {false, true}) {
-            weights->cpu_execution = split ? std::make_shared<engine::core::ExecutionContext>(backend) : nullptr;
+            weights->experts.reset();
+            weights->store = std::make_shared<engine::core::BackendWeightStore>(execution.backend(),
+                execution.backend_type(), "test.drama3.primary", 1024 * 1024);
+            engine::core::MoeExecutionPolicy policy;
+            policy.residency = split ? engine::core::MoeExpertResidency::Staged : engine::core::MoeExpertResidency::Backend;
+            weights->experts = std::make_unique<engine::core::MoeResources>(execution, *norm_source,
+                *weights->store, policy, "test.drama3.cpu", 1024 * 1024);
             for (bool buffer_failure : {true, false}) {
                 fail_buffer = buffer_failure;
                 fail_graph = !buffer_failure;
                 for (int attempt = 0; attempt < 3; ++attempt) {
                     bool rejected = false;
+                    allocation_calls = 0;
                     try {
                         drama::Drama3BackboneCachedDecodeGraph graph(execution, weights, config, 32, 8 * 1024 * 1024);
                     } catch (const std::runtime_error & error) {
-                        if (std::string(error.what()) != "failed to allocate Drama 3 backbone cached decode graph") throw;
+                        const std::string expected = buffer_failure ? "failed to allocate Drama 3 backbone cached decode graph"
+                            : split ? "Cannot allocate drama3_backbone.cached_decode scheduled graph"
+                                    : "cannot reserve graph activation workspace";
+                        if (std::string(error.what()) != expected) throw;
                         rejected = true;
                     }
                     if (!rejected) throw std::runtime_error("injected allocation failure was not rejected");
@@ -97,6 +131,36 @@ int main(int argc, char ** argv) {
             }
             if (!live_buffers.empty()) throw std::runtime_error("normal destruction leaked a persistent buffer");
         }
+        auto * head_weight = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 16, 16);
+        std::fill_n(static_cast<float *>(head_weight->data), 256, 0.125F);
+        weights->lm_head.weight = engine::core::wrap_tensor(head_weight,
+            engine::core::TensorShape::from_dims({16, 16}));
+        config.vocab_size = 16;
+        for (bool buffer_failure : {true, false}) {
+            {
+                drama::LmHeadGraph head(execution, weights, config, 8 * 1024 * 1024);
+                fail_buffer = buffer_failure;
+                fail_graph = !buffer_failure;
+                allocation_calls = 0;
+                bool rejected = false;
+                try { head.run(std::vector<float>(16, 0.5F)); }
+                catch (const std::runtime_error & error) {
+                    const std::string expected = buffer_failure ? "Cannot allocate drama3_backbone.lm_head persistent tensors"
+                        : "cannot reserve graph activation workspace";
+                    if (std::string(error.what()) != expected) throw;
+                    rejected = true;
+                }
+                if (!rejected || !live_buffers.empty())
+                    throw std::runtime_error("failed LM-head preparation published or leaked partial resources");
+                fail_buffer = fail_graph = false;
+                if (head.run(std::vector<float>(16, 0.5F)) != std::vector<float>(16, 1.0F))
+                    throw std::runtime_error("LM head did not recover after failed cached graph preparation");
+                ++head_recoveries;
+            }
+            if (!live_buffers.empty()) throw std::runtime_error("LM-head teardown leaked prepared resources");
+        }
+        }
+        std::cout << "cached_head_recoveries=" << head_recoveries << '\n';
         std::cout << "rejected_allocations=" << failures << " live_buffers=0 recovery_cases=2\n";
 
         engine::debug::configure_logging({true, std::nullopt});
@@ -105,12 +169,6 @@ int main(int argc, char ** argv) {
         if (argc > 1 && std::string(argv[1]) == "cuda") test_backend.type = engine::core::BackendType::Cuda;
         if (argc > 1 && std::string(argv[1]) == "vulkan") test_backend.type = engine::core::BackendType::Vulkan;
         engine::core::ExecutionContext prefill_execution(test_backend);
-        struct FixtureDirectory {
-            std::filesystem::path path = std::filesystem::temp_directory_path() /
-                ("drama3_prefill_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-            FixtureDirectory() { std::filesystem::create_directories(path); }
-            ~FixtureDirectory() { std::error_code error; std::filesystem::remove_all(path, error); }
-        } fixture;
         auto c = config;
         c.kv_cache_type = GGML_TYPE_F32;
         c.vocab_size = 16;
@@ -118,7 +176,7 @@ int main(int argc, char ** argv) {
         c.layers = 2;
         c.experts = 32;
         c.experts_per_token = 2;
-        c.expert_cache_size = 4;
+        c.moe.cache_slots = 4;
         c.heads = 4;
         c.kv_heads = 2;
         c.head_dim = 64;
@@ -250,7 +308,7 @@ int main(int argc, char ** argv) {
                 if (maximum > 1e-4F) throw std::runtime_error("decode optimization changed fixed-input continuation");
             }
         }
-        c.disk_experts = true;
+        c.moe.residency = engine::core::MoeExpertResidency::Staged;
         auto disk = drama::load_qwen35_weights(*source, c, prefill_execution, 4 * 1024 * 1024, engine::assets::TensorStorageType::Native);
         for (int64_t steps : {1, 7}) {
             std::unique_ptr<ggml_context, drama::GgmlContextDeleter> routing_context(

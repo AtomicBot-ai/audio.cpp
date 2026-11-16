@@ -16,6 +16,7 @@ struct PocketTTSDescriptor {
     float default_temperature = 0.7F;
     bool pad_with_spaces_for_short_inputs = false;
     bool remove_semicolons = false;
+    bool capitalize_first_letter = true;
     bool insert_bos_before_voice = false;
     std::optional<int> model_recommended_frames_after_eos;
     int sample_rate = 24000;
@@ -25,6 +26,7 @@ struct PocketTTSDescriptor {
     // transformer depth: the *_24l models have 24 transformer layers but a 6-block flow net.
     int flow_depth = 6;
     int flow_dim = 1024;
+    int flow_condition_dim = 1024;
     int flow_heads = 16;
     int flow_hidden_size = 512;
     int flow_intermediate_size = 4096;
@@ -48,6 +50,7 @@ PocketTTSDescriptor descriptor_from_yaml(const io::yaml::FlattenedDocument & par
     descriptor.pad_with_spaces_for_short_inputs =
         io::yaml::optional_bool(parsed, "pad_with_spaces_for_short_inputs", false);
     descriptor.remove_semicolons = io::yaml::optional_bool(parsed, "remove_semicolons", false);
+    descriptor.capitalize_first_letter = io::yaml::optional_bool(parsed, "capitalize_first_letter", true);
     descriptor.insert_bos_before_voice = io::yaml::optional_bool(parsed, "flow_lm.insert_bos_before_voice", false);
     descriptor.model_recommended_frames_after_eos = io::yaml::optional_int(parsed, "model_recommended_frames_after_eos");
     descriptor.sample_rate = io::yaml::require_int(parsed, "mimi.sample_rate");
@@ -55,6 +58,7 @@ PocketTTSDescriptor descriptor_from_yaml(const io::yaml::FlattenedDocument & par
     descriptor.flow_layers = io::yaml::require_int(parsed, "flow_lm.transformer.num_layers");
     descriptor.flow_depth = io::yaml::optional_int(parsed, "flow_lm.flow.depth").value_or(descriptor.flow_depth);
     descriptor.flow_dim = io::yaml::require_int(parsed, "flow_lm.transformer.d_model");
+    descriptor.flow_condition_dim = io::yaml::optional_nullable_int(parsed, "flow_lm.z_dim").value_or(descriptor.flow_dim);
     descriptor.flow_heads = io::yaml::require_int(parsed, "flow_lm.transformer.num_heads");
     descriptor.flow_hidden_size = io::yaml::require_int(parsed, "flow_lm.flow.dim");
     descriptor.flow_intermediate_size =
@@ -115,6 +119,7 @@ PocketTTSModelConfig make_model_config(const PocketTTSDescriptor & descriptor) {
     config.flow_layers = descriptor.flow_layers;
     config.flow_depth = descriptor.flow_depth;
     config.flow_dim = descriptor.flow_dim;
+    config.flow_condition_dim = descriptor.flow_condition_dim;
     config.flow_heads = descriptor.flow_heads;
     config.flow_hidden_size = descriptor.flow_hidden_size;
     config.flow_intermediate_size = descriptor.flow_intermediate_size;
@@ -131,6 +136,7 @@ PocketTTSModelConfig make_model_config(const PocketTTSDescriptor & descriptor) {
     config.mimi_encoder_upsample_stride = descriptor.mimi_encoder_upsample_stride;
     config.pad_with_spaces_for_short_inputs = descriptor.pad_with_spaces_for_short_inputs;
     config.remove_semicolons = descriptor.remove_semicolons;
+    config.capitalize_first_letter = descriptor.capitalize_first_letter;
     config.insert_bos_before_voice = descriptor.insert_bos_before_voice;
     config.model_recommended_frames_after_eos = descriptor.model_recommended_frames_after_eos;
     return config;
@@ -153,6 +159,7 @@ PocketTTSAssets load_assets_from_resources(
     const auto tensor_source = resources.open_tensor_source("weights");
 
     PocketTTSAssets manifest;
+    manifest.impl = &implementation_for_family("pocket_tts");
     manifest.resources = std::move(resources);
     manifest.model_weights = tensor_source;
     manifest.voice_asset_root = tensor_source->source_path().parent_path();
