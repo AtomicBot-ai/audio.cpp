@@ -1,3 +1,4 @@
+#include "engine/framework/core/prepared_graph.h"
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Adapted for audio.cpp from NVIDIA/NeMo-Speech.cpp, revision 66d50d91b75a406becd95fbaf39d2c9c13e95d7c.
@@ -8,6 +9,7 @@
 #include "engine/framework/core/execution_context.h"
 #include "engine/framework/modules/linear_module.h"
 #include "engine/framework/modules/norm_modules.h"
+#include "engine/framework/modules/speech_encoders/rope_transformer_encoder_runtime.h"
 #include "engine/framework/modules/weight_binding.h"
 
 #include <ggml-alloc.h>
@@ -69,20 +71,9 @@ int validate_evidence(const CtcEvidence & evidence, const CtcConfig & c) {
     return frames;
 }
 
-core::TensorValue value(ggml_tensor * tensor) {
-    return core::wrap_tensor(tensor, core::TensorShape::from_dims(
-        {tensor->ne[3], tensor->ne[2], tensor->ne[1], tensor->ne[0]}), tensor->type);
-}
-
-struct LayerWeights {
-    modules::NormWeights norm1, norm2, q_norm, k_norm;
-    modules::LinearWeights qkv, out, ff_in, ff_out;
-};
-
 struct Weights {
-    modules::NormWeights embed, final;
+    modules::RopeTransformerEncoderWeights transformer;
     modules::LinearWeights upsample, classifier;
-    std::vector<LayerWeights> layers;
 };
 
 Weights load_weights(core::BackendWeightStore & store, const assets::TensorSource & source,
@@ -94,26 +85,26 @@ Weights load_weights(core::BackendWeightStore & store, const assets::TensorSourc
         weights.upsample = binding::linear_from_source(store, source, "ctc.upsample", type,
             c.upsampling * c.dimension, c.dimension, true);
     }
-    weights.embed = binding::norm_from_source(store, source, "ctc.transformer.embed_norm", c.dimension);
-    weights.final = binding::norm_from_source(store, source, "ctc.transformer.final_norm", c.dimension);
+    weights.transformer.input_norm = binding::norm_from_source(store, source, "ctc.transformer.embed_norm", c.dimension);
+    weights.transformer.final_norm = binding::norm_from_source(store, source, "ctc.transformer.final_norm", c.dimension);
     for (int i = 0; i < c.layers; ++i) {
         const auto prefix = "ctc.transformer.layers." + std::to_string(i);
-        LayerWeights layer;
+        modules::RopeTransformerEncoderLayerWeights layer;
         layer.norm1 = binding::norm_from_source(store, source, prefix + ".norm1", c.dimension);
         layer.norm2 = binding::norm_from_source(store, source, prefix + ".norm2", c.dimension);
         layer.qkv = binding::linear_from_source(store, source, prefix + ".attn.w_qkv", type,
             3 * c.dimension, c.dimension, c.qkv_bias);
-        layer.out = binding::linear_from_source(store, source, prefix + ".attn.out_proj", type,
+        layer.attention_output = binding::linear_from_source(store, source, prefix + ".attn.out_proj", type,
             c.dimension, c.dimension, true);
         if (c.qk_norm) {
             layer.q_norm = binding::norm_from_source(store, source, prefix + ".attn.q_norm", c.dimension / c.heads);
             layer.k_norm = binding::norm_from_source(store, source, prefix + ".attn.k_norm", c.dimension / c.heads);
         }
-        layer.ff_in = binding::linear_from_source(store, source, prefix + ".ffn.net.0", type,
+        layer.ffn_in = binding::linear_from_source(store, source, prefix + ".ffn.net.0", type,
             c.ff_hidden, c.dimension, true);
-        layer.ff_out = binding::linear_from_source(store, source, prefix + ".ffn.net.3", type,
+        layer.ffn_out = binding::linear_from_source(store, source, prefix + ".ffn.net.3", type,
             c.dimension, c.ff_hidden, true);
-        weights.layers.push_back(std::move(layer));
+        weights.transformer.layers.push_back(std::move(layer));
     }
     weights.classifier = binding::linear_from_source(store, source, "ctc.classifier", type,
         c.vocabulary, c.dimension, true);
@@ -123,116 +114,43 @@ Weights load_weights(core::BackendWeightStore & store, const assets::TensorSourc
 // All graphs use the framework backend, host plan, and CUDA capture cleanup. The
 // shape caches are model-local and retain only one shape of each graph kind.
 struct Graph {
-    core::ExecutionContext & execution;
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> context{nullptr, ggml_free};
-    std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> allocator{nullptr, ggml_gallocr_free};
-    ggml_cgraph * graph = nullptr;
+    core::PreparedGraph prepared;
     ggml_tensor * input = nullptr;
     ggml_tensor * positions = nullptr;
     ggml_tensor * ids = nullptr;
     ggml_tensor * output = nullptr;
     ggml_tensor * maximum = nullptr;
-    core::HostGraphPlan plan;
+    ggml_tensor * logsumexp = nullptr;
     int frames = 0;
     int columns = 0;
+    int kept = 0;
 
-    explicit Graph(core::ExecutionContext & execution_in, size_t nodes = 4096)
-        : execution(execution_in) {
-        context.reset(ggml_init({nodes * ggml_tensor_overhead() +
-            ggml_graph_overhead_custom(nodes, false), nullptr, true}));
-        if (!context) throw std::runtime_error("Nemotron CTC graph context allocation failed");
-        graph = ggml_new_graph_custom(context.get(), nodes, false);
-    }
-
-    ~Graph() {
-        plan.reset();
-        core::release_backend_graph_resources(execution.backend(), graph, true);
-    }
+    explicit Graph(core::ExecutionContext & execution, size_t nodes = 4096)
+        : prepared(execution, {"nemotron.ctc", nodes * ggml_tensor_overhead() +
+            ggml_graph_overhead_custom(nodes, false), nodes}) {}
 
     void allocate() {
         ggml_set_input(input);
         if (positions) ggml_set_input(positions);
         if (ids) ggml_set_input(ids);
         ggml_set_output(output);
-        ggml_build_forward_expand(graph, output);
+        ggml_build_forward_expand(prepared.graph(), output);
+        if (logsumexp) {
+            ggml_set_output(logsumexp);
+            ggml_build_forward_expand(prepared.graph(), logsumexp);
+        }
         if (maximum) {
             ggml_set_output(maximum);
-            ggml_build_forward_expand(graph, maximum);
+            ggml_build_forward_expand(prepared.graph(), maximum);
         }
-        core::validate_backend_graph_supported(execution.backend(), graph, "nemotron.ctc");
-        allocator.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(execution.backend())));
-        if (!allocator || !ggml_gallocr_alloc_graph(allocator.get(), graph)) {
-            throw std::runtime_error("Nemotron CTC graph allocation failed");
-        }
-        core::prepare_host_graph_plan(execution, graph, plan);
+        prepared.allocate();
     }
 
     void run(const float * rows, size_t count) {
         ggml_backend_tensor_set(input, rows, 0, count * sizeof(float));
-        if (core::compute_graph(execution, graph, plan, "nemotron.ctc") != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("Nemotron CTC graph execution failed");
-        }
-        ggml_backend_synchronize(execution.backend());
+        prepared.compute();
     }
 };
-
-ggml_tensor * norm(core::ModuleBuildContext & ctx, ggml_tensor * x,
-    const modules::NormWeights & weights, const CtcConfig & c) {
-    // Normalize each head before partial NeoX RoPE, using the module's
-    // portable contiguous-input lowering for the strided Q/K split views.
-    return modules::LayerNormModule({x->ne[0], c.norm_epsilon, true, true})
-        .build(ctx, value(x), weights).tensor;
-}
-
-ggml_tensor * linear(core::ModuleBuildContext & ctx, ggml_tensor * x,
-    const modules::LinearWeights & weights) {
-    return modules::LinearModule({weights.weight.tensor->ne[0], weights.weight.tensor->ne[1],
-        weights.bias.has_value(), GGML_PREC_F32}).build(ctx, value(x), weights).tensor;
-}
-
-std::unique_ptr<Graph> bridge_graph(core::ExecutionContext & execution, const Weights & weights,
-    const CtcConfig & c, int encoder_frames) {
-    auto g = std::make_unique<Graph>(execution, std::max<size_t>(4096, 512 + size_t(c.layers) * 192));
-    g->frames = encoder_frames;
-    auto * ctx = g->context.get();
-    core::ModuleBuildContext build{ctx, "nemotron.ctc.bridge", execution.backend_type()};
-    const int T = ctc_frames(encoder_frames, c.upsampling), D = c.dimension, H = c.heads, K = D / H;
-    g->input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, encoder_frames);
-    g->positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
-    auto * x = g->input;
-    if (c.upsampling > 1) x = ggml_reshape_2d(ctx, linear(build, x, weights.upsample), D, T);
-    auto * h = norm(build, x, weights.embed, c);
-    for (const auto & layer : weights.layers) {
-        auto * qkv = linear(build, norm(build, h, layer.norm1, c), layer.qkv);
-        const auto split = [&](int part) {
-            return ggml_view_3d(ctx, qkv, K, H, T, size_t(K) * sizeof(float), qkv->nb[1],
-                size_t(part) * D * sizeof(float));
-        };
-        auto * q = split(0);
-        auto * k = split(1);
-        auto * v = split(2);
-        if (c.qk_norm) {
-            q = norm(build, q, layer.q_norm, c);
-            k = norm(build, k, layer.k_norm, c);
-        }
-        q = ggml_rope_ext(ctx, q, g->positions, nullptr, c.rotary_dims, GGML_ROPE_TYPE_NEOX,
-            0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k = ggml_rope_ext(ctx, k, g->positions, nullptr, c.rotary_dims, GGML_ROPE_TYPE_NEOX,
-            0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        // Match the reference's F16 K/V attention inputs and F32 accumulation.
-        auto * attended = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3),
-            ggml_cast(ctx, ggml_permute(ctx, k, 0, 2, 1, 3), GGML_TYPE_F16),
-            ggml_cast(ctx, ggml_permute(ctx, v, 0, 2, 1, 3), GGML_TYPE_F16), nullptr,
-            1.0f / std::sqrt(float(K)), 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attended, GGML_PREC_F32);
-        h = ggml_add(ctx, h, linear(build, ggml_reshape_2d(ctx, attended, D, T), layer.out));
-        auto * ff = linear(build, norm(build, h, layer.norm2, c), layer.ff_in);
-        h = ggml_add(ctx, h, linear(build, ggml_gelu_erf(ctx, ff), layer.ff_out));
-    }
-    g->output = ggml_add(ctx, x, ggml_scale(ctx, norm(build, h, weights.final, c), c.residual_scale));
-    g->allocate();
-    return g;
-}
 
 ggml_tensor * row_max(ggml_context * ctx, ggml_tensor * x) {
     const int64_t n = x->ne[0], rows = x->ne[1];
@@ -241,33 +159,61 @@ ggml_tensor * row_max(ggml_context * ctx, ggml_tensor * x) {
         ggml_get_rows(ctx, ggml_reshape_3d(ctx, x, 1, n, rows), column), 1, rows);
 }
 
-std::unique_ptr<Graph> normalizer_graph(core::ExecutionContext & execution, const Weights & weights,
-    const CtcConfig & c, int frames) {
+std::unique_ptr<Graph> bridge_graph(core::ExecutionContext & execution, const Weights & weights,
+    const CtcConfig & c, int encoder_frames, int kept) {
     const size_t chunks = (size_t(c.vocabulary) + kClassChunk - 1) / kClassChunk;
-    auto g = std::make_unique<Graph>(execution, std::max<size_t>(4096, 256 + chunks * 32));
-    g->frames = frames;
-    auto * ctx = g->context.get();
-    auto * w = weights.classifier.weight.tensor;
-    auto * b = weights.classifier.bias->tensor;
-    g->input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.dimension, frames);
-    ggml_tensor * peaks = nullptr, * sums = nullptr;
-    // Retain chunk summaries, not full-vocabulary logits. GGML's allocator can
-    // reuse one [frames, <=4096] logits buffer between these graph branches.
-    for (int first = 0; first < c.vocabulary;) {
-        const int count = std::min(kClassChunk, c.vocabulary - first);
-        auto * logits = ggml_mul_mat(ctx,
-            ggml_view_2d(ctx, w, c.dimension, count, w->nb[1], size_t(first) * w->nb[1]), g->input);
-        ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
-        logits = ggml_add(ctx, logits, ggml_view_1d(ctx, b, count, size_t(first) * b->nb[0]));
-        auto * peak = row_max(ctx, logits);
-        auto * sum = ggml_sum_rows(ctx, ggml_exp(ctx, ggml_sub(ctx, logits, peak)));
-        peaks = peaks ? ggml_concat(ctx, peaks, peak, 0) : peak;
-        sums = sums ? ggml_concat(ctx, sums, sum, 0) : sum;
-        first += count;
+    auto g = std::make_unique<Graph>(execution, std::max<size_t>(4096, 512 + size_t(c.layers) * 192 + chunks * 32));
+    g->frames = encoder_frames;
+    g->kept = kept;
+    auto * ctx = g->prepared.build_context().ggml;
+    auto build = g->prepared.build_context();
+    build.module_instance_name = "nemotron.ctc.bridge";
+    const int T = ctc_frames(encoder_frames, c.upsampling), D = c.dimension;
+    g->input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, encoder_frames);
+    g->positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+    auto input = core::wrap_tensor(g->input, core::TensorShape::from_dims({1, encoder_frames, D}));
+    if (c.upsampling > 1) {
+        input = modules::LinearModule({D, c.upsampling * D, true, GGML_PREC_F32})
+            .build(build, input, weights.upsample);
+        input = core::reshape_tensor(build, input, core::TensorShape::from_dims({1, T, D}));
     }
-    g->maximum = row_max(ctx, peaks);
-    g->output = ggml_add(ctx, ggml_log(ctx, ggml_sum_rows(ctx,
-        ggml_mul(ctx, sums, ggml_exp(ctx, ggml_sub(ctx, peaks, g->maximum))))), g->maximum);
+    modules::RopeTransformerEncoderConfig config;
+    config.hidden_size = D;
+    config.intermediate_size = c.ff_hidden;
+    config.heads = c.heads;
+    config.rotary_dimensions = c.rotary_dims;
+    config.norm_epsilon = c.norm_epsilon;
+    config.qk_norm = c.qk_norm;
+    config.projection_precision = GGML_PREC_F32;
+    config.f16_kv = true;
+    auto encoded = modules::RopeTransformerEncoderModule(config).build(build, input,
+        {core::wrap_tensor(g->positions, core::TensorShape::from_dims({T}), GGML_TYPE_I32), {}, {}, {}},
+        weights.transformer);
+    g->output = ggml_add(ctx, input.tensor, ggml_scale(ctx, encoded.tensor, c.residual_scale));
+    if (kept > 0) {
+        g->ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kept);
+        g->output = ggml_get_rows(ctx, g->output, g->ids);
+        auto * w = weights.classifier.weight.tensor;
+        auto * b = weights.classifier.bias->tensor;
+        ggml_tensor * peaks = nullptr, * sums = nullptr;
+        // Retain chunk summaries, not full-vocabulary logits. GGML's allocator can
+        // reuse one [frames, <=4096] logits buffer between these graph branches.
+        for (int first_class = 0; first_class < c.vocabulary;) {
+            const int count = std::min(kClassChunk, c.vocabulary - first_class);
+            auto * logits = ggml_mul_mat(ctx,
+                ggml_view_2d(ctx, w, c.dimension, count, w->nb[1], size_t(first_class) * w->nb[1]), g->output);
+            ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+            logits = ggml_add(ctx, logits, ggml_view_1d(ctx, b, count, size_t(first_class) * b->nb[0]));
+            auto * peak = row_max(ctx, logits);
+            auto * sum = ggml_sum_rows(ctx, ggml_exp(ctx, ggml_sub(ctx, logits, peak)));
+            peaks = peaks ? ggml_concat(ctx, peaks, peak, 0) : peak;
+            sums = sums ? ggml_concat(ctx, sums, sum, 0) : sum;
+            first_class += count;
+        }
+        g->maximum = row_max(ctx, peaks);
+        g->logsumexp = ggml_add(ctx, ggml_log(ctx, ggml_sum_rows(ctx,
+            ggml_mul(ctx, sums, ggml_exp(ctx, ggml_sub(ctx, peaks, g->maximum))))), g->maximum);
+    }
     g->allocate();
     return g;
 }
@@ -277,7 +223,7 @@ std::unique_ptr<Graph> projection_graph(core::ExecutionContext & execution, cons
     auto g = std::make_unique<Graph>(execution);
     g->frames = frames;
     g->columns = columns;
-    auto * ctx = g->context.get();
+    auto * ctx = g->prepared.build_context().ggml;
     g->input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.dimension, frames);
     g->ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, columns);
     auto * selected = ggml_get_rows(ctx, weights.classifier.weight.tensor, g->ids);
@@ -298,8 +244,9 @@ struct CtcTimestampHead::Impl {
     core::BackendWeightStore store;
     Weights weights;
     std::unique_ptr<sentencepiece::SentencePieceProcessor> tokenizer;
-    std::unique_ptr<Graph> bridge_cache, normalizer_cache, projection_cache;
+    std::unique_ptr<Graph> bridge_cache, projection_cache;
     std::mutex mutex;
+    decoders::CtcHostDecoder alignment;
 
     Impl(std::shared_ptr<const assets::TensorSource> source, core::ExecutionContext & execution_in,
         CtcConfig config_in, const std::string & serialized_tokenizer)
@@ -319,21 +266,26 @@ struct CtcTimestampHead::Impl {
         store.upload();
     }
 
-    std::vector<float> bridge(const float * states, int frames) {
+    Graph & bridge(const float * states, int frames, int first = 0, int kept = 0) {
         const int count = ctc_frames(frames, config.upsampling);
         if (!states) throw std::invalid_argument("missing CTC ASR states");
         if (std::any_of(states, states + size_t(frames) * config.dimension,
                 [](float x) { return !std::isfinite(x); }))
             throw std::invalid_argument("non-finite CTC ASR states");
-        if (!bridge_cache || bridge_cache->frames != frames) {
+        if (!bridge_cache || bridge_cache->frames != frames || bridge_cache->kept != kept) {
             bridge_cache.reset();
-            bridge_cache = bridge_graph(execution, weights, config, frames);
+            bridge_cache = bridge_graph(execution, weights, config, frames, kept);
         }
         std::vector<int32_t> positions(static_cast<size_t>(count));
         for (int i = 0; i < count; ++i) positions[i] = i;
         ggml_backend_tensor_set(bridge_cache->positions, positions.data(), 0, positions.size() * sizeof(int32_t));
+        if (kept > 0) {
+            positions.resize(static_cast<size_t>(kept));
+            for (int i = 0; i < kept; ++i) positions[i] = first + i;
+            ggml_backend_tensor_set(bridge_cache->ids, positions.data(), 0, positions.size() * sizeof(int32_t));
+        }
         bridge_cache->run(states, size_t(frames) * config.dimension);
-        return core::read_tensor_f32(bridge_cache->output);
+        return *bridge_cache;
     }
 
     std::vector<float> project(const float * hidden, int frames, const std::vector<int> & columns) {
@@ -375,7 +327,7 @@ const CtcConfig & CtcTimestampHead::config() const noexcept { return impl_->conf
 
 std::vector<float> CtcTimestampHead::bridge(const float * states, int frames) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return impl_->bridge(states, frames);
+    return core::read_tensor_f32(impl_->bridge(states, frames).output);
 }
 
 std::vector<float> CtcTimestampHead::project(const float * hidden, int frames, const std::vector<int> & columns) {
@@ -400,18 +352,12 @@ CtcEvidence CtcTimestampHead::prepare(const float * states, int encoder_frames, 
     std::lock_guard<std::mutex> lock(impl_->mutex);
     for (const auto & window : ::engine::models::nemotron_transcribe::timestamps::head_windows(encoder_frames, options.head_window,
              options.head_left_context, options.head_right_context)) {
-        const auto h = impl_->bridge(states + size_t(window.context_start) * c.dimension,
-            window.context_end - window.context_start);
         const int first = window.start * c.upsampling, count = (window.end - window.start) * c.upsampling;
-        const float * kept = h.data() + size_t(window.start - window.context_start) * c.upsampling * c.dimension;
-        std::copy_n(kept, size_t(count) * c.dimension, evidence.hidden.data() + size_t(first) * c.dimension);
-        if (!impl_->normalizer_cache || impl_->normalizer_cache->frames != count) {
-            impl_->normalizer_cache.reset();
-            impl_->normalizer_cache = normalizer_graph(impl_->execution, impl_->weights, c, count);
-        }
-        auto & g = *impl_->normalizer_cache;
-        g.run(kept, size_t(count) * c.dimension);
-        ggml_backend_tensor_get(g.output, evidence.logsumexp.data() + first, 0, size_t(count) * sizeof(float));
+        auto & g = impl_->bridge(states + size_t(window.context_start) * c.dimension,
+            window.context_end - window.context_start, (window.start - window.context_start) * c.upsampling, count);
+        ggml_backend_tensor_get(g.output, evidence.hidden.data() + size_t(first) * c.dimension,
+            0, size_t(count) * c.dimension * sizeof(float));
+        ggml_backend_tensor_get(g.logsumexp, evidence.logsumexp.data() + first, 0, size_t(count) * sizeof(float));
         ggml_backend_tensor_get(g.maximum, evidence.maximum.data() + first, 0, size_t(count) * sizeof(float));
     }
     return evidence;
@@ -501,7 +447,10 @@ CtcTimestampResult CtcTimestampHead::timestamps(const CtcEvidence & evidence,
         inputs.time_offset = speakers.time_offset;
         ts::AlignmentConfig align_config;
         align_config.max_word_frames = 12 * impl_->config.upsampling;
-        result.alignment = ts::align_record(result.targets, inputs, align_config);
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            result.alignment = ts::align_record(result.targets, inputs, impl_->alignment, align_config);
+        }
         result.alignment.words = ts::public_words(result.alignment.words);
         for (auto & segment : result.alignment.diarization) {
             segment.start = ts::round_decimals(segment.start, 3);

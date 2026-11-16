@@ -20,6 +20,7 @@
 #include "engine/framework/io/json.h"
 #include "engine/framework/runtime/registry.h"
 #include "engine/framework/runtime/session.h"
+#include "engine/framework/runtime/options.h"
 
 #include <algorithm>
 #include <chrono>
@@ -60,7 +61,7 @@ void print_task_list_help() {
         << "    --task vad|asr|diar|sep|gen|tts|clon|vc|s2s|align|vdes|spk|svc|midi|wake|cls\n"
         << "    --family <name>\n"
         << "    --model <path>\n"
-        << "    --backend cpu|cuda|hip|rocm|vulkan|metal|webgpu|best  (rocm is an alias for hip)\n"
+        << "    --backend cpu|cuda|hip|rocm|vulkan|metal|webgpu|sycl|best  (rocm is an alias for hip)\n"
         << "    --mode offline|streaming  default offline\n"
         << "    --device <n>\n"
         << "    --backend-impl <name>             optional backend implementation; default preserves existing dispatch\n"
@@ -79,6 +80,12 @@ void print_task_list_help() {
         << "    --metrics  Print compact wall time, audio duration, and RTF summary after offline generation\n"
         << "    --load-option key=value\n"
         << "    --session-option key=value\n"
+        << "    --moe-cpu-share <0..1>             session CPU share of disk-expert cache misses; default 0\n"
+        << "    --moe-disk-experts <bool>         stage expert weights through bounded caches\n"
+        << "    --moe-pin-experts <bool>          pin staged expert banks in host RAM\n"
+        << "    --moe-expert-cache-size <int>     expert slots per routed layer\n"
+        << "    --moe-disk-expert-read-threads <int>  host expert read workers\n"
+        << "    --moe-cpu-expert-layers <int>     first N MoE layers execute on CPU\n"
         << "    --request-option key=value\n"
         << "  Batch:\n"
         << "    --request-sequence <json>  Run JSON requests in one offline session\n"
@@ -784,6 +791,25 @@ int audiocpp_cli_main(int argc, char ** argv) {
             return 0;
         }
 
+        auto common_session_options = collect_key_value_args(argc, argv, "--session-option");
+        if (const auto value = find_arg(argc, argv, "--moe-cpu-share")) {
+            const auto moe_cpu_share = engine::runtime::parse_finite_float_option({{"moe_cpu_share", *value}}, {"moe_cpu_share"}).value();
+            if (moe_cpu_share < 0 || moe_cpu_share > 1) throw std::runtime_error("--moe-cpu-share must be between zero and one");
+            common_session_options["moe_cpu_share"] = *value;
+        }
+        for (const auto & entry : {
+                 std::make_pair("--moe-disk-experts", "moe_disk_experts"),
+                 std::make_pair("--moe-pin-experts", "moe_pin_experts"),
+                 std::make_pair("--moe-expert-cache-size", "moe_expert_cache_size"),
+                 std::make_pair("--moe-disk-expert-read-threads", "moe_disk_expert_read_threads"),
+                 std::make_pair("--moe-cpu-expert-layers", "moe_cpu_expert_layers")}) {
+            if (const auto value = find_arg(argc, argv, entry.first)) {
+                if (common_session_options.count(entry.second))
+                    throw std::invalid_argument(std::string("duplicate shared MoE session option: ") + entry.second);
+                common_session_options[entry.second] = *value;
+            }
+        }
+
         const auto model_arg = find_arg(argc, argv, "--model");
         const auto pipeline_arg = find_arg(argc, argv, "--pipeline");
         const auto recipe_arg = find_arg(argc, argv, "--recipe");
@@ -813,7 +839,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
                     backend,
                     optional_path_arg(argc, argv, "--out"),
                     collect_key_value_args(argc, argv, "--load-option"),
-                    collect_key_value_args(argc, argv, "--session-option"),
+                    common_session_options,
                     workflow_inputs,
                     optional_path_arg(argc, argv, "--model-spec-override"),
                     audio_converter,
@@ -821,6 +847,15 @@ int audiocpp_cli_main(int argc, char ** argv) {
             return 0;
         }
         if (recipe_arg.has_value()) {
+            for (const auto & option : common_session_options) {
+                // Preserve the previously accepted disabled global option;
+                // active MoE placement still needs an explicit recipe role.
+                if (option.first == "moe_cpu_share" &&
+                    engine::runtime::parse_finite_float_option(common_session_options, {"moe_cpu_share"}).value() == 0)
+                    continue;
+                if (option.first.compare(0, 4, "moe_") == 0)
+                    throw std::runtime_error("recipes require role-scoped MoE options: --session-option <role>." + option.first + "=<value>");
+            }
             const int threads = parse_int_arg(argc, argv, "--threads", 4);
             if (threads <= 0) {
                 throw std::runtime_error("--threads must be positive");
@@ -834,7 +869,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
             }
             recipe_options.model_families = collect_key_value_args(argc, argv, "--recipe-family");
             recipe_options.load_options = collect_key_value_args(argc, argv, "--load-option");
-            recipe_options.session_options = collect_key_value_args(argc, argv, "--session-option");
+            recipe_options.session_options = common_session_options;
             recipe_options.model_spec_override = optional_path_arg(argc, argv, "--model-spec-override");
             recipe_options.backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
             recipe_options.backend.impl = find_arg(argc, argv, "--backend-impl").value_or("");
@@ -937,7 +972,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
 #ifdef _OPENMP
         omp_set_num_threads(threads);
 #endif
-        session_options.options = collect_key_value_args(argc, argv, "--session-option");
+        session_options.options = common_session_options;
         // Parsed before the model loads so a bad value fails fast.
         const auto wav_options = wav_write_options_from_cli(argc, argv);
         auto model = registry.load(load_request);

@@ -17,6 +17,8 @@ struct Conv1dConfig {
     bool use_bias = true;
     // Preserve BF16 convolution and bias rounding, with F32 graph outputs.
     bool bf16_compute = false;
+    // Stride-one, pre-padded convolution without an im2col matrix.
+    bool per_tap = false;
 };
 
 struct Conv1dWeights {
@@ -58,6 +60,8 @@ ggml_tensor * conv1d_pertap_channel_fast(
 
 enum class Conv2dLayout { ChannelsFirst, ChannelsLast };
 
+enum class Conv2dImpl { Default, ChannelFast };
+
 struct Conv2dConfig {
     int64_t in_channels = 0;
     int64_t out_channels = 0;
@@ -79,6 +83,8 @@ struct Conv2dConfig {
     bool metal_per_tap = false;
     // Opt-in Metal F32 implicit MMA, IC divisible by 32; other cases retain the existing path.
     bool implicit_gemm = false;
+    // Channel-fast lowering for ChannelsLast activations, where supported.
+    Conv2dImpl impl = Conv2dImpl::Default;
 };
 
 struct Conv2dWeights {
@@ -289,6 +295,8 @@ struct DepthwiseConv2dConfig {
     int dilation_height = 1;
     int dilation_width = 1;
     bool use_bias = true;
+    // Channel-fast lowering for ChannelsLast activations, where supported.
+    Conv2dImpl impl = Conv2dImpl::Default;
 };
 
 class DepthwiseConv2dModule {
