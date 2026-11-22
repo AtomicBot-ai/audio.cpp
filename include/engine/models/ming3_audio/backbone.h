@@ -2,8 +2,9 @@
 
 #include "engine/models/ming3_audio/assets.h"
 #include "engine/framework/core/backend_weight_store.h"
-#include "engine/framework/core/moe_resources.h"
+#include "engine/framework/moe_engine/moe_prepared_graph.h"
 #include "engine/framework/modules/linear_module.h"
+#include "engine/framework/modules/feed_forward_modules.h"
 #include "engine/framework/modules/norm_modules.h"
 
 #include <array>
@@ -11,7 +12,7 @@
 namespace engine::models::ming3_audio {
 
 struct ThinkerOptions {
-    core::MoeExecutionPolicy moe{core::MoeExpertResidency::Backend, true, 8, 1, {}, 0};
+    moe::EngineConfig moe{moe::Residency::Resident, true, 8, 1, {}, {}};
 };
 
 struct KdaWeights {
@@ -39,15 +40,9 @@ struct ThinkerLayerWeights {
     modules::NormWeights post_norm;
     KdaWeights kda;
     MlaWeights mla;
-    modules::LinearWeights mlp_gate_up;
-    modules::LinearWeights mlp_down;
-    core::TensorValue router;
-    core::TensorValue router_bias;
-    core::TensorValue expert_gate;
-    core::TensorValue expert_up;
-    core::TensorValue expert_down;
-    core::DiskExpertWeightStore * disk_store = nullptr;
-    size_t disk_group = 0;
+    modules::GatedFeedForwardConfig shared_config;
+    modules::GatedFeedForwardWeights shared;
+    moe::LayerId expert;
 };
 
 struct ThinkerWeights {
@@ -55,10 +50,9 @@ struct ThinkerWeights {
                    const ThinkerConfig & config, const ThinkerOptions & options = {});
 
     core::BackendWeightStore store;
-    std::unique_ptr<core::MoeResources> experts;
+    std::unique_ptr<moe::MoeEngine> experts;
     core::TensorValue embedding;
     core::TensorValue head;
-    core::TensorValue group_identity;
     modules::NormWeights norm;
     std::vector<ThinkerLayerWeights> layers;
 };
@@ -81,7 +75,7 @@ KdaOutput build_kda(core::ModuleBuildContext & ctx, const core::TensorValue & in
 
 core::TensorValue build_thinker_mlp(core::ModuleBuildContext & ctx, const core::TensorValue & input,
                                    const ThinkerLayerWeights & weights, const ThinkerConfig & config,
-                                   const core::TensorValue & group_identity, bool routed);
+                                   bool routed, moe::MoePreparedGraph & graph, moe::MoeEngine & engine);
 
 class Thinker {
 public:

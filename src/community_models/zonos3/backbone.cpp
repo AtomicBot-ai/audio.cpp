@@ -1,18 +1,16 @@
+#include "engine/framework/modules/gated_delta_net_module.h"
 #include "engine/community_models/zonos3/backbone.h"
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
-#include "engine/framework/core/disk_expert_weight_store.h"
 #include "engine/framework/core/graph_workspace.h"
-#include "engine/framework/core/prepared_graph.h"
+#include "engine/framework/moe_engine/moe_prepared_graph.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/modules/activation_modules.h"
 #include "engine/framework/modules/feed_forward_modules.h"
 #include "engine/framework/modules/linear_module.h"
-#include "engine/framework/modules/moe_module.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/positional_modules.h"
-#include "engine/framework/modules/staged_moe_runtime.h"
 
 #include <ggml-backend.h>
 
@@ -39,8 +37,9 @@ struct LayerWeights {
     TensorValue wq, wk, wv, wo, attn_temp, attn_gate;           // global attention
     TensorValue gdn_in, gdn_conv, gdn_norm, gdn_a_log, gdn_dt;  // gated DeltaNet
     TensorValue ffn_up, ffn_gate, ffn_down;                     // dense SwiGLU
-    TensorValue up_exps, gate_exps, down_exps, latent_down, latent_up, router, router_norm, neg_router_bias;
-    size_t disk_group = 0;
+    modules::LinearWeights latent_down, latent_up;
+    modules::NormWeights router_norm;
+    moe::LayerId expert;
     int state_index = -1;  // index into the KV caches (global layers) or GDN states
 };
 
@@ -104,7 +103,7 @@ public:
         }
         ggml_backend_buffer_clear(state_buffer_.get(), 0);
         n_past_.assign(2, 0);
-        if (disk_store_) disk_store_->invalidate_cache();
+        resources_->begin_generation();
     }
 
     void prefill(int slot, const Zonos3Prompt & prompt, std::vector<float> & logits) {
@@ -117,7 +116,7 @@ public:
         for (int position = 0; position < prompt.n_rows; position += kPrefillChunk) {
             const int rows = std::min(kPrefillChunk, prompt.n_rows - position);
             const GraphShape shape{rows, 1, slot, true};
-            if (disk_store_) {
+            if (resources_->staged()) {
                 auto & graph = offload_graph(shape);
                 set_prefill_inputs(graph.inputs, shape, prompt, position);
                 graph.run();
@@ -154,38 +153,25 @@ public:
 
 private:
     struct ForwardGraph {
-        std::unique_ptr<core::PreparedGraph> prepared;
+        std::unique_ptr<moe::MoePreparedGraph> prepared;
         GraphShape shape;
         GraphInputs inputs;
         ggml_tensor * logits = nullptr;
     };
 
     // Expert-cache prefill: a 256-row chunk routes more experts than the per-layer cache holds, so every MoE layer
-    // runs through StagedMoeRuntime between per-layer graphs. Full AttnRes sources cross graph boundaries through
+    // runs through the engine between per-layer graphs. Full AttnRes sources cross graph boundaries through
     // persistent stacks.
     struct OffloadGraph {
         GraphShape shape;
         GraphInputs inputs;
         std::shared_ptr<core::GraphWorkspace> workspace;
-        std::unique_ptr<core::PreparedGraph> prepared;
-        std::unique_ptr<modules::StagedMoeRuntime> staged;
-        std::vector<core::PreparedGraph::GraphId> layer_graphs, finish_graphs;
-        std::vector<int64_t> staged_layers;
-        core::PreparedGraph::GraphId final_graph = 0;
+        std::unique_ptr<moe::MoePreparedGraph> prepared;
+        moe::MoePreparedGraph::SequenceId sequence{0};
+        size_t final_graph = 0;
         ggml_tensor * logits = nullptr;
 
-        void run() {
-            prepared->compute(0);
-            uint64_t rows = 0;
-            for (size_t layer = 0; layer < layer_graphs.size(); ++layer) {
-                prepared->compute(layer_graphs[layer]);
-                if (staged_layers[layer] < 0) continue;
-                rows += staged->run(static_cast<size_t>(staged_layers[layer]));
-                prepared->compute(finish_graphs[layer]);
-            }
-            prepared->compute(final_graph);
-            debug::timing_log_scalar("zonos3.offload_prefill_expert_rows", rows);
-        }
+        void run() { prepared->compute(sequence); }
     };
 
     // Full AttnRes: every source is scored once against all 2L+1 queries as it enters the bank; a route softmaxes
@@ -235,11 +221,6 @@ private:
         int count_ = 0;
     };
 
-    struct MoeInputs {
-        modules::MoeRouting routing;
-        ggml_tensor * latent = nullptr;  // [latent, rows]
-    };
-
     int queries() const { return 2 * hp_.n_layer + 1; }
     static TensorValue matrix(ggml_tensor * x) { return core::wrap_tensor(x, core::TensorShape::from_dims({x->ne[1], x->ne[0]})); }
 
@@ -270,14 +251,14 @@ private:
         const int H = hp_.gdn_heads;
         const int S = hp_.gdn_head_dim;
         const int I = H * S;
-        if (options_.moe.pin_host_weights && options_.moe.residency != core::MoeExpertResidency::Staged) {
+        if (options_.moe.pin_host_weights && options_.moe.residency != moe::Residency::Staged) {
             throw std::runtime_error("zonos3.pin_experts requires zonos3.disk_experts=true");
         }
         int top_k = 0;
         int min_experts = std::numeric_limits<int>::max();
         for (int layer = 1; layer < hp_.n_layer; ++layer) {
             const int used = hp_.expert_used[static_cast<size_t>(layer)];
-            if (top_k != 0 && used != top_k && (options_.moe.residency == core::MoeExpertResidency::Staged)) {
+            if (top_k != 0 && used != top_k && (options_.moe.residency == moe::Residency::Staged)) {
                 throw std::runtime_error("zonos3 disk_experts requires the same top-k in every MoE layer");
             }
             top_k = used;
@@ -285,7 +266,7 @@ private:
                 source.require_metadata("blk." + std::to_string(layer) + ".ffn_up_exps.weight").shape[0]));
         }
         top_k_ = top_k;
-        if (options_.moe.residency == core::MoeExpertResidency::Staged) {
+        if (options_.moe.residency == moe::Residency::Staged) {
             if (options_.moe.cache_slots < 2 * top_k || options_.moe.cache_slots > min_experts) {
                 throw std::runtime_error("zonos3.expert_cache_size must be between " + std::to_string(2 * top_k) + " and " +
                                          std::to_string(min_experts));
@@ -295,7 +276,7 @@ private:
                                                             "zonos3.backbone.weights", 16 * 1024 * 1024);
         extra_buffer_types_ = core::cpu_extra_buffer_types(execution_.backend());
         core::BackendWeightStore * expert_weights = store_.get();
-        if (options_.moe.residency == core::MoeExpertResidency::Backend && options_.repack_experts) {
+        if (options_.moe.residency == moe::Residency::Resident && options_.repack_experts) {
             for (auto * buffer_type : extra_buffer_types_) {
                 bool supported = true;
                 for (int layer = 1; layer < hp_.n_layer && supported; ++layer) {
@@ -331,9 +312,8 @@ private:
                 }
             }
         }
-        resources_ = std::make_unique<core::MoeResources>(execution_, source, *expert_weights, options_.moe,
+        resources_ = std::make_unique<moe::MoeEngine>(execution_, *expert_weights, source, options_.moe,
                                                         "zonos3.backbone.experts", 16 * 1024 * 1024);
-        disk_store_ = resources_->disk_store();
         auto native = [&](const std::string & name, std::vector<int64_t> shape) {
             consumed_.insert(name);
             return store_->load_tensor(source, name, assets::TensorStorageType::Native, shape);
@@ -415,26 +395,31 @@ private:
                 const int64_t latent = bank[2];
                 const std::vector<std::string> names{p + "ffn_up_exps.weight", p + "ffn_gate_exps.weight",
                                                      p + "ffn_down_exps.weight"};
-                std::vector<core::MoeExpertTensorBinding> bindings;
+                moe::LayerBindings bindings;
                 const std::vector<std::vector<int64_t>> shapes{bank, bank, {experts, latent, hidden}};
                 for (size_t i = 0; i < names.size(); ++i) {
                     consumed_.insert(names[i]);
-                    bindings.push_back({names[i], names[i], shapes[i], assets::TensorStorageType::Native});
+                    bindings.experts.push_back({names[i], names[i], shapes[i], assets::TensorStorageType::Native});
                 }
-                const auto & experts_layer = resources_->bind_layer(static_cast<size_t>(layer - 1),
-                    static_cast<size_t>(layer), bindings, w.top_k);
-                w.disk_group = experts_layer.disk_group;
-                w.up_exps = experts_layer.weights[0];
-                w.gate_exps = experts_layer.weights[1];
-                w.down_exps = experts_layer.weights[2];
-                w.latent_down = matmul(p + "ffn_latent_down.weight", {latent, D});
-                w.latent_up = matmul(p + "ffn_latent_up.weight", {D, latent});
-                w.router = matmul(p + "router.weight", {experts, D});
-                w.router_norm = f32(p + "router_norm.weight", {D});
+                bindings.experts[0].role = moe::ProjectionRole::Up;
+                bindings.experts[1].role = moe::ProjectionRole::Gate;
+                bindings.experts[2].role = moe::ProjectionRole::Down;
+                w.latent_down.weight = matmul(p + "ffn_latent_down.weight", {latent, D});
+                w.latent_up.weight = matmul(p + "ffn_latent_up.weight", {D, latent});
+                bindings.router = matmul(p + "router.weight", {experts, D});
+                w.router_norm.weight = f32(p + "router_norm.weight", {D});
                 consumed_.insert(p + "router_bias");
                 auto bias = source.require_f32(p + "router_bias", {experts});
                 for (auto & value : bias) value = -value;  // routing ranks logits - router_bias
-                w.neg_router_bias = store_->make_f32(core::TensorShape::from_dims({experts}), std::move(bias));
+                bindings.selection_bias = store_->make_f32(core::TensorShape::from_dims({experts}), std::move(bias));
+                moe::LayerMath math;
+                math.routing.experts = experts;
+                math.routing.selected = w.top_k;
+                math.routing.scoring = moe::Scoring::SelectedSoftmax;
+                math.routing.normalization = moe::Normalization::None;
+                math.routing.precision = GGML_PREC_F32;
+                math.routing.contiguous_ids = resources_->staged();
+                w.expert = resources_->register_layer(std::move(bindings), math);
                 latent_ = static_cast<int>(latent);
             }
             layers_.push_back(std::move(w));
@@ -450,8 +435,8 @@ private:
         for (auto & extra : extra_stores_) extra.second->upload();
         resources_->finalize_weights();
         assets_->backbone->release_storage();
-        if (disk_store_) {
-            const auto stats = disk_store_->statistics();
+        if (resources_->staged()) {
+            const auto stats = resources_->statistics();
             debug::timing_log_scalar("zonos3.expert_cache_mb", stats.buffer_bytes / (1024.0 * 1024.0));
             debug::timing_log_scalar("zonos3.host_experts_mb", stats.host_buffer_bytes / (1024.0 * 1024.0));
         }
@@ -481,7 +466,7 @@ private:
         debug::timing_log_scalar("zonos3.state_mb", ggml_backend_buffer_get_size(state_buffer_.get()) / (1024.0 * 1024.0));
     }
 
-    GraphInputs make_inputs(core::PreparedGraph & prepared, const GraphShape & shape) const {
+    GraphInputs make_inputs(moe::MoePreparedGraph & prepared, const GraphShape & shape) const {
         auto * g = prepared.persistent_build_context().ggml;
         const int N = shape.rows();
         GraphInputs in;
@@ -576,53 +561,32 @@ private:
         const int R = hp_.gdn_conv_kernel - 1;
         const int T = shape.rows_per_slot;
         const int B = shape.slots;
-        const int N = shape.rows();
-        auto * mixed = linear(ctx, x, w.gdn_in);  // [q k v | z | a | b] x N
-        auto rows = [&](int first, int count) {
-            return ggml_view_2d(g, mixed, count, N, mixed->nb[1], static_cast<size_t>(first) * mixed->nb[0]);
-        };
         auto * hs = gdn_history_[static_cast<size_t>(w.state_index)];
         auto * ss = gdn_states_[static_cast<size_t>(w.state_index)];
         auto * history = ggml_view_3d(g, hs, R, 3 * I, B, hs->nb[1], hs->nb[2], static_cast<size_t>(shape.first_slot) * hs->nb[2]);
         auto * state = ggml_view_3d(g, ss, ss->ne[0], 1, B, ss->nb[1], ss->nb[2], static_cast<size_t>(shape.first_slot) * ss->nb[2]);
-        auto * time_major = T == 1
-            ? ggml_view_3d(g, mixed, 1, 3 * I, B, mixed->nb[0], mixed->nb[1], 0)
-            : ggml_reshape_3d(g, ggml_cont(g, ggml_transpose(g, rows(0, 3 * I))), T, 3 * I, 1);
-        auto * window = ggml_concat(g, history, time_major, 0);  // [R + T, 3I, B]
-        auto * conv = ggml_ssm_conv(g, window, w.gdn_conv.tensor);
-        conv = modules::SiluModule().build(
-            ctx, core::wrap_tensor(conv, core::TensorShape::from_dims({B, T, 3 * I}))).tensor;
-        conv = ggml_reshape_2d(g, conv, 3 * I, N);
-        auto heads = [&](int first) {
-            return ggml_view_4d(g, conv, S, H, T, B, static_cast<size_t>(S) * conv->nb[0], conv->nb[1],
-                                static_cast<size_t>(T) * conv->nb[1], static_cast<size_t>(first) * conv->nb[0]);
-        };
-        // FLA's q / sqrt(sum q^2 + eps), unlike ggml_l2_norm's max(norm, eps).
-        auto l2 = [&](ggml_tensor * t) {
-            return ggml_scale(g, ggml_rms_norm(g, t, 1e-6f / static_cast<float>(S)), 1.0f / std::sqrt(static_cast<float>(S)));
-        };
-        auto * q = l2(heads(0));
-        auto * k = l2(heads(I));
-        auto * v = heads(2 * I);
-        auto * decay = ggml_neg(g, ggml_mul(g, ggml_softplus(g, ggml_add(g, rows(4 * I, H), w.gdn_dt.tensor)),
-                                            ggml_exp(g, w.gdn_a_log.tensor)));
-        auto * beta = modules::SigmoidModule().build(ctx, matrix(rows(4 * I + H, H))).tensor;
-        decay = ggml_reshape_4d(g, decay, 1, H, T, B);
-        beta = ggml_reshape_4d(g, beta, 1, H, T, B);
-        auto * packed = ggml_gated_delta_net(g, q, k, v, decay, beta, state);  // [I, N + S*B]
-        auto * output = ggml_view_2d(g, packed, I, N, static_cast<size_t>(I) * sizeof(float), 0);
-        auto * next_state = ggml_view_1d(g, packed, ggml_nelements(state), static_cast<size_t>(I) * N * sizeof(float));
-        auto * next_history = ggml_cont(g, ggml_view_3d(g, window, R, 3 * I, B, window->nb[1], window->nb[2],
-                                                        static_cast<size_t>(T) * window->nb[0]));
-        ggml_build_forward_expand(graph, ggml_cpy(g, next_state, state));
-        ggml_build_forward_expand(graph, ggml_cpy(g, next_history, history));
-        auto * z = ggml_view_3d(g, mixed, S, H, N, static_cast<size_t>(S) * mixed->nb[0], mixed->nb[1],
-                                static_cast<size_t>(3 * I) * mixed->nb[0]);
-        auto * normed = ggml_mul(g, ggml_rms_norm(g, ggml_reshape_3d(g, output, S, H, N), 1e-5f), w.gdn_norm.tensor);
-        auto * activated_z = modules::SiluModule().build(
-            ctx, core::wrap_tensor(z, core::TensorShape::from_dims({N, H, S}))).tensor;
-        auto * gated = ggml_mul(g, normed, activated_z);
-        return linear(ctx, ggml_reshape_2d(g, gated, I, N), w.wo);
+        modules::GatedDeltaNetConfig config;
+        config.hidden_size = hp_.n_embd;
+        config.key_head_dim = config.value_head_dim = S;
+        config.key_heads = config.value_heads = H;
+        config.conv_kernel = hp_.gdn_conv_kernel;
+        config.norm_epsilon = 1e-5F;
+        config.qk_norm = modules::GatedDeltaNetQkNorm::SumSquares;
+        config.projection_precision = GGML_PREC_F32;
+        modules::GatedDeltaNetWeights weights;
+        weights.in_proj = {w.gdn_in, std::nullopt};
+        weights.conv_weight = w.gdn_conv;
+        weights.dt_bias = w.gdn_dt;
+        weights.a_log = w.gdn_a_log;
+        weights.norm.weight = w.gdn_norm;
+        weights.out_proj = {w.wo, std::nullopt};
+        const auto output = modules::GatedDeltaNetModule(config).build(ctx,
+            core::wrap_tensor(ggml_reshape_3d(g, x, hp_.n_embd, T, B), core::TensorShape::from_dims({B, T, hp_.n_embd})),
+            core::wrap_tensor(state, core::TensorShape::from_dims({B, 1, ss->ne[0]})), weights,
+            core::wrap_tensor(history, core::TensorShape::from_dims({B, 3 * I, R})));
+        ggml_build_forward_expand(graph, ggml_cpy(g, output.next_recurrent_state.tensor, state));
+        ggml_build_forward_expand(graph, ggml_cpy(g, output.next_conv_tail.tensor, history));
+        return ggml_reshape_2d(g, output.output.tensor, hp_.n_embd, shape.rows());
     }
 
     ggml_tensor * dense_ffn(core::ModuleBuildContext & ctx, const LayerWeights & w, ggml_tensor * x) const {
@@ -637,29 +601,17 @@ private:
             .tensor;
     }
 
-    // Weighted RMSNorm -> router; experts rank logits - router_bias and weigh the softmax of their raw logits. The
-    // experts read the latent projection of the FFN input, not the router norm.
-    MoeInputs build_moe_inputs(core::ModuleBuildContext & ctx, ggml_tensor * x, const LayerWeights & w) const {
-        auto * normed = rms_weighted(ctx, x, w.router_norm, hp_.rms_eps);
-        modules::MoeRoutingConfig config;
-        config.experts = w.router.tensor->ne[1];
-        config.selected = w.top_k;
-        config.scoring = modules::MoeScoring::SelectedSoftmax;
-        config.normalization = modules::MoeNormalization::None;
-        config.precision = GGML_PREC_F32;
-        config.contiguous_ids = disk_store_ != nullptr;
-        MoeInputs out;
-        out.routing = modules::MoeModule::build_routing(ctx, normed, w.router.tensor, w.neg_router_bias.tensor, config);
-        out.latent = linear(ctx, x, w.latent_down);
-        return out;
-    }
-
-    ggml_tensor * moe(core::ModuleBuildContext & ctx, ggml_tensor * x, const LayerWeights & w) const {
-        const auto inputs = build_moe_inputs(ctx, x, w);
-        auto * bank_ids = disk_store_ ? disk_store_->route(ctx, inputs.routing.ids, w.disk_group) : nullptr;
-        auto * y = modules::MoeModule({modules::MoeActivation::SwiGlu}).build(
-            ctx, inputs.latent, inputs.routing, {w.up_exps.tensor, w.gate_exps.tensor, w.down_exps.tensor}, bank_ids);
-        return linear(ctx, y, w.latent_up);
+    ggml_tensor * moe(moe::MoePreparedGraph & graph, core::ModuleBuildContext & ctx,
+        ggml_tensor * input, const LayerWeights & w) {
+        const auto shape = core::TensorShape::from_dims({input->ne[1], input->ne[0]});
+        auto x = core::wrap_tensor(input, shape);
+        auto normalized = modules::RMSNormModule({hp_.n_embd, hp_.rms_eps, true, false}).build(ctx, x, w.router_norm);
+        const auto routing = resources_->route(ctx, w.expert, normalized.tensor);
+        auto latent = modules::LinearModule({hp_.n_embd, w.latent_down.weight.tensor->ne[1], false, GGML_PREC_F32}).build(ctx, x, w.latent_down);
+        auto * routed = resources_->build(graph, w.expert, latent.tensor, &routing);
+        auto output = modules::LinearModule({routed->ne[0], hp_.n_embd, false, GGML_PREC_F32}).build(ctx,
+            core::wrap_tensor(routed, core::TensorShape::from_dims({input->ne[1], routed->ne[0]})), w.latent_up);
+        return output.tensor;
     }
 
     // output_norm, the 10 x 4098 head and the logit softcap over the head rows.
@@ -673,10 +625,6 @@ private:
             logits = ggml_scale(g, ggml_tanh(g, ggml_scale(g, logits, 1.0f / hp_.logit_softcap)), hp_.logit_softcap);
         }
         return logits;
-    }
-
-    void configure_expert_scheduler(core::PreparedGraph & prepared) {
-        resources_->configure_scheduler(prepared);
     }
 
     ForwardGraph & forward_graph(std::vector<std::unique_ptr<ForwardGraph>> & cache, const GraphShape & shape) {
@@ -693,7 +641,7 @@ private:
         auto out = std::make_unique<ForwardGraph>();
         out->shape = shape;
         const size_t metadata = ggml_graph_overhead_custom(kGraphNodes, false) + kGraphNodes * ggml_tensor_overhead();
-        out->prepared = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+        out->prepared = std::make_unique<moe::MoePreparedGraph>(execution_, core::PreparedGraphConfig{
             shape.prefill ? "zonos3.prefill" : "zonos3.decode", metadata, kGraphNodes, 64 * ggml_tensor_overhead()});
         out->inputs = make_inputs(*out->prepared, shape);
         out->prepared->allocate_persistent();
@@ -708,12 +656,11 @@ private:
             auto * input = rms_weighted(ctx, bank.route(x, 2 * layer), w.attn_norm, hp_.rms_eps);
             auto * mixer = w.gdn ? gated_delta_net(ctx, graph, w, input, shape) : attention(ctx, w, input, out->inputs, shape);
             input = rms_weighted(ctx, bank.route(mixer, 2 * layer + 1), w.ffn_norm, hp_.rms_eps);
-            x = w.top_k == 0 ? dense_ffn(ctx, w, input) : moe(ctx, input, w);
+            x = w.top_k == 0 ? dense_ffn(ctx, w, input) : moe(*out->prepared, ctx, input, w);
         }
         out->logits = head(ctx, bank.route(x, 2 * hp_.n_layer), N, shape.prefill ? 1 : shape.slots);
         ggml_set_output(out->logits);
         ggml_build_forward_expand(graph, out->logits);
-        if (disk_store_ || resources_->has_cpu_layers()) configure_expert_scheduler(*out->prepared);
         out->prepared->allocate();
         cache.push_back(std::move(out));
         return *cache.back();
@@ -738,23 +685,12 @@ private:
         const int T = shape.rows_per_slot;
         const int Q = queries();
         const int D = hp_.n_embd;
-        int64_t bucket = std::min<int64_t>(T, 32);
-        while ((bucket & (bucket - 1)) != 0) ++bucket;
-        modules::StagedMoeConfig staged;
-        staged.hidden_size = latent_;
-        staged.tokens = T;
-        staged.selected = top_k_;
-        staged.experts = hp_.n_expert;
-        staged.cache_slots = options_.moe.cache_slots;
-        for (int64_t count = 1; count <= bucket; count *= 2) staged.rows_per_expert.push_back(count);
-        staged.scatter_index_type = GGML_TYPE_I32;
         out->workspace = std::make_shared<core::GraphWorkspace>(execution_.backend());
-        out->staged = std::make_unique<modules::StagedMoeRuntime>(execution_, std::move(staged), out->workspace, resources_->cpu_execution());
         const size_t nodes = 2048;
         const size_t graphs = static_cast<size_t>(2 * hp_.n_layer + 2);
-        out->prepared = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+        out->prepared = std::make_unique<moe::MoePreparedGraph>(execution_, core::PreparedGraphConfig{
             "zonos3.offload_prefill", graphs * (ggml_graph_overhead_custom(nodes, false) + 1024 * ggml_tensor_overhead()),
-            nodes, 4 * 1024 * 1024});
+            nodes, 4 * 1024 * 1024}, out->workspace);
         out->inputs = make_inputs(*out->prepared, shape);
         auto * persistent = out->prepared->persistent_build_context().ggml;
         auto * sources = ggml_new_tensor_3d(persistent, GGML_TYPE_F32, D, Q, T);  // Full AttnRes sources
@@ -786,6 +722,7 @@ private:
             auto * all_sources = ggml_concat(g, stack_view(sources, 0, n - 1), ggml_reshape_3d(g, source, D, 1, T), 1);
             return bank.mix(all_scores, all_sources, n, qi);
         };
+        std::vector<moe::MoePreparedGraph::Step> sequence{size_t{0}};
         auto * embed_graph = out->prepared->graph(0);
         append(embed_graph, embed(ctx, out->inputs, T), 0);
         for (int layer = 0; layer < hp_.n_layer; ++layer) {
@@ -795,30 +732,31 @@ private:
             auto * input = rms_weighted(ctx, route_stacked(2 * layer + 1, 2 * layer), w.attn_norm, hp_.rms_eps);
             auto * mixer = w.gdn ? gated_delta_net(ctx, graph, w, input, shape) : attention(ctx, w, input, out->inputs, shape);
             input = rms_weighted(ctx, route_with(graph, mixer, 2 * layer + 2, 2 * layer + 1), w.ffn_norm, hp_.rms_eps);
-            out->layer_graphs.push_back(id);
             if (w.top_k == 0) {
                 append(graph, dense_ffn(ctx, w, input), 2 * layer + 2);
-                out->finish_graphs.push_back(0);
-                out->staged_layers.push_back(-1);
+                sequence.emplace_back(id);
                 continue;
             }
-            const auto inputs = build_moe_inputs(ctx, input, w);
-            out->staged->build_inputs(ctx, graph, inputs.latent, inputs.routing);
-            out->staged_layers.push_back(static_cast<int64_t>(out->staged->add_layer(
-                modules::MoeModule({modules::MoeActivation::SwiGlu}),
-                {w.up_exps.tensor, w.gate_exps.tensor, w.down_exps.tensor}, *disk_store_, w.disk_group)));
+            auto x = core::wrap_tensor(input, core::TensorShape::from_dims({T, D}));
+            auto normalized = modules::RMSNormModule({D, hp_.rms_eps, true, false}).build(ctx, x, w.router_norm);
+            const auto routing = resources_->route(ctx, w.expert, normalized.tensor);
+            auto latent = modules::LinearModule({D, latent_, false, GGML_PREC_F32}).build(ctx, x, w.latent_down);
+            const auto call = resources_->add_call(w.expert, {T, latent_, latent_, 32, GGML_TYPE_I32}, out->workspace);
+            resources_->build_inputs(call, *out->prepared, id, latent.tensor, &routing);
             const auto finish = out->prepared->add_graph("finish_" + std::to_string(layer), nodes);
-            auto * combined = modules::MoeModule::combine(ctx, out->staged->output(), out->staged->routing_weights());
-            append(out->prepared->graph(finish), linear(ctx, combined, w.latent_up), 2 * layer + 2);
-            out->finish_graphs.push_back(finish);
+            auto * routed = resources_->build_result(call, *out->prepared);
+            auto result = modules::LinearModule({latent_, D, false, GGML_PREC_F32}).build(ctx,
+                core::wrap_tensor(routed, core::TensorShape::from_dims({T, latent_})), w.latent_up);
+            append(out->prepared->graph(finish), result.tensor, 2 * layer + 2);
+            sequence.emplace_back(id); sequence.emplace_back(call); sequence.emplace_back(finish);
         }
         out->final_graph = out->prepared->add_graph("final", nodes);
         out->logits = head(ctx, route_stacked(Q, Q - 1), T, 1);
         ggml_set_output(out->logits);
         ggml_build_forward_expand(out->prepared->graph(out->final_graph), out->logits);
-        out->workspace->add(*out->prepared);
-        out->workspace->prepare();
-        out->staged->prepare();
+        sequence.emplace_back(out->final_graph);
+        out->sequence = out->prepared->add_sequence(std::move(sequence));
+        out->prepared->allocate();
         return out;
     }
 
@@ -892,8 +830,7 @@ private:
     std::unique_ptr<core::BackendWeightStore> store_;
     std::vector<ggml_backend_buffer_type_t> extra_buffer_types_;
     std::vector<std::pair<ggml_backend_buffer_type_t, std::unique_ptr<core::BackendWeightStore>>> extra_stores_;
-    std::unique_ptr<core::MoeResources> resources_;
-    core::DiskExpertWeightStore * disk_store_ = nullptr;
+    std::unique_ptr<moe::MoeEngine> resources_;
     std::set<std::string> consumed_;
     std::vector<TensorValue> audio_embd_, cond_embd_;
     TensorValue text_embd_, output_norm_, output_, attnres_q_, speaker_proj_, speaker_bias_;

@@ -1,3 +1,4 @@
+#include "engine/framework/runtime/moe_options.h"
 #include "args.h"
 #include "batch.h"
 #include "partial_render.h"
@@ -67,6 +68,7 @@ void print_task_list_help() {
         << "    --backend-impl <name>             optional backend implementation; default preserves existing dispatch\n"
         << "    --list-devices  List available backend devices and exit; --json adds PCI ids and memory\n"
         << "    --threads <n>  Backend and OpenMP worker threads, default 4\n"
+        << "    --config-file <yaml>  Load CLI options from YAML; explicit scalar CLI values take precedence\n"
         << "    --registry-config <path>\n"
         << "    --model-spec-override <json-or-directory|embedded>  Select a spec file/directory or the GGUF's embedded spec\n"
         << "    --config <id>\n"
@@ -80,6 +82,7 @@ void print_task_list_help() {
         << "    --metrics  Print compact wall time, audio duration, and RTF summary after offline generation\n"
         << "    --load-option key=value\n"
         << "    --session-option key=value\n"
+        << "    --moe-policy <placement[,eviction]> select independent MoE execution/cache policies\n"
         << "    --moe-cpu-share <0..1>             session CPU share of disk-expert cache misses; default 0\n"
         << "    --moe-disk-experts <bool>         stage expert weights through bounded caches\n"
         << "    --moe-pin-experts <bool>          pin staged expert banks in host RAM\n"
@@ -798,6 +801,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
             common_session_options["moe_cpu_share"] = *value;
         }
         for (const auto & entry : {
+                 std::make_pair("--moe-policy", "moe_policy"),
                  std::make_pair("--moe-disk-experts", "moe_disk_experts"),
                  std::make_pair("--moe-pin-experts", "moe_pin_experts"),
                  std::make_pair("--moe-expert-cache-size", "moe_expert_cache_size"),
@@ -847,12 +851,12 @@ int audiocpp_cli_main(int argc, char ** argv) {
             return 0;
         }
         if (recipe_arg.has_value()) {
+            const auto policies = engine::runtime::resolve_moe_policies(common_session_options);
+            const auto prepared_policy = engine::moe::prepare_policy(policies);
             for (const auto & option : common_session_options) {
-                // Preserve the previously accepted disabled global option;
-                // active MoE placement still needs an explicit recipe role.
-                if (option.first == "moe_cpu_share" &&
-                    engine::runtime::parse_finite_float_option(common_session_options, {"moe_cpu_share"}).value() == 0)
-                    continue;
+                const bool policy_key = option.first == "moe_policy" || option.first == "moe_cpu_share" ||
+                    option.first.rfind("moe_policy_params.", 0) == 0;
+                if (policy_key && !prepared_policy.active_placement && policies.eviction.name == "default") continue;
                 if (option.first.compare(0, 4, "moe_") == 0)
                     throw std::runtime_error("recipes require role-scoped MoE options: --session-option <role>." + option.first + "=<value>");
             }
@@ -1137,15 +1141,24 @@ int audiocpp_cli_main(int argc, char ** argv) {
 int wmain(int argc, wchar_t ** wargv) {
     try {
         auto utf8_args = wide_args_to_utf8(argc, wargv);
-        std::vector<char *> argv;
-        argv.reserve(utf8_args.size() + 1);
+        std::vector<char *> utf8_argv;
+        utf8_argv.reserve(utf8_args.size() + 1);
         for (auto & arg : utf8_args) {
+            utf8_argv.push_back(arg.data());
+        }
+        utf8_argv.push_back(nullptr);
+
+        auto expanded_args = minitts::cli::expand_cli_args(argc, utf8_argv.data());
+        std::vector<char *> argv;
+        argv.reserve(expanded_args.size() + 1);
+        for (auto & arg : expanded_args) {
             argv.push_back(arg.data());
         }
         argv.push_back(nullptr);
-        const int status = audiocpp_cli_main(argc, argv.data());
-        if (status == 0 && !minitts::cli::has_arg(argc, argv.data(), "--version")) {
-            minitts::cli::warn_ignored_args(argc, argv.data());
+        const int expanded_argc = static_cast<int>(expanded_args.size());
+        const int status = audiocpp_cli_main(expanded_argc, argv.data());
+        if (status == 0 && !minitts::cli::has_arg(expanded_argc, argv.data(), "--version")) {
+            minitts::cli::warn_ignored_args(expanded_argc, argv.data());
         }
         return status;
     } catch (const std::exception & ex) {
@@ -1155,10 +1168,23 @@ int wmain(int argc, wchar_t ** wargv) {
 }
 #else
 int main(int argc, char ** argv) {
-    const int status = audiocpp_cli_main(argc, argv);
-    if (status == 0 && !minitts::cli::has_arg(argc, argv, "--version")) {
-        minitts::cli::warn_ignored_args(argc, argv);
+    try {
+        auto expanded_args = minitts::cli::expand_cli_args(argc, argv);
+        std::vector<char *> expanded_argv;
+        expanded_argv.reserve(expanded_args.size() + 1);
+        for (auto & arg : expanded_args) {
+            expanded_argv.push_back(arg.data());
+        }
+        expanded_argv.push_back(nullptr);
+        const int expanded_argc = static_cast<int>(expanded_args.size());
+        const int status = audiocpp_cli_main(expanded_argc, expanded_argv.data());
+        if (status == 0 && !minitts::cli::has_arg(expanded_argc, expanded_argv.data(), "--version")) {
+            minitts::cli::warn_ignored_args(expanded_argc, expanded_argv.data());
+        }
+        return status;
+    } catch (const std::exception & ex) {
+        std::cerr << "audiocpp_cli failed: " << ex.what() << "\n";
+        return 1;
     }
-    return status;
 }
 #endif

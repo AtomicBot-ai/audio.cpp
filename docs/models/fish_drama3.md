@@ -272,6 +272,7 @@ are rejected without staging, preserving alias equivalence.
 | `fish_drama3.codec_batch_frames` | `int` | `4` | Streaming codec batch ceiling. Starts at one frame and grows to this size; partial final batches are flushed. Offline decoding is unchanged. Declared range: minimum 1. |
 | `fish_drama3.codec_async_decode` | `bool` | `true` | Overlap streaming codec decoding with AR generation on the dedicated codec backend. Uses a bounded queue and waits for all audio before completing the request. |
 | `fish_drama3.device_sampling` | `bool` | `false` | Enable tower decode and codebook sampling in one cached backend graph. Disabled by default; enabled by cuda_perf unless explicitly overridden. Uses F32 probabilities; sampled outputs may differ from the host sampler. |
+| `fish_drama3.reference_cache_slots` | `int` | `8` | Encoded reference voices kept in host memory (0 to 64), least recently used evicted first. A hit needs the exact same waveform; 0 encodes every request. Each slot keeps its waveform (up to 5.3 MB). |
 | `fish_drama3.profile_first_audio` | `bool` | `false` | Emit first-audio stage timings to stderr for performance diagnosis. Disabled by default. |
 | `fish_drama3.context_length` | `int` | `2048` | Cache capacity for prompt plus generated frames; includes references and history. Declared range: minimum 1. |
 | `moe_cpu_expert_layers` | `int` | `4` | Number of the 40 expert banks kept and evaluated on CPU; use 4 for a 24 GB profile or 24 for a 16 GB profile. Dense layers and the tower use the selected backend. Declared range: minimum 0, maximum 40. |
@@ -588,3 +589,7 @@ offload placement can change floating-point results and the sampled take.
 The weights are subject to the Fish Audio Community License. See the model
 repository's [LICENSE](https://huggingface.co/Jmica/Drama-3-GGUF/blob/main/LICENSE)
 and [NOTICE](https://huggingface.co/Jmica/Drama-3-GGUF/blob/main/NOTICE).
+
+### MoE engine policies
+
+The routed backbone accepts independent placement and cache-eviction policies through `moe_policy` and stage-scoped `moe_policy_params.placement.*` / `moe_policy_params.eviction.*`. See [shared controls and policy parameters](../usage.md#independent-moe-policies). Omitted policies preserve the model's existing residency and CPU-layer defaults. Active policies require staged experts; shared/dense branches and model state remain on their existing paths.

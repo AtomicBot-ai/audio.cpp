@@ -15,21 +15,22 @@ Lost in a sea of audio model names, papers, and codebases? Explore **100+ audio 
 
 > [!TIP]
 >
-> **v0.9.5 highlights**
+> **v0.9.6 highlights**
 >
-> **New models and variants:** Generate speech with [Zonos2](docs/models/zonos2.md) and [Zonos3-Mini](docs/models/zonos3.md), sound effects with [MOSS-SoundEffect v2](docs/models/moss_soundeffect.md), and cover songs with [MuLaCover](docs/models/mulacover.md). Speech recognition gains [Kroko XL](docs/models/kroko_asr.md) and Danish [Edda ASR](docs/models/edda_asr.md). [MossFormer2](docs/models/mossformer2.md) now supports speech enhancement and super-resolution alongside separation. Audio8 TTS defaults to the [Realistic 0.6B](docs/models/audio8_tts.md) package, and KugelAudio gains reference-audio voice cloning.
+> **New models:** [SoulX-Singer](docs/models/soulx_singer.md) supports singing synthesis and voice conversion; [Tiny Voca](docs/models/tiny_voca.md) offers compact English TTS; and [Inworld Voice Isolator](docs/models/voice_isolator.md) removes background sound with offline and streaming checkpoints. [M5-TTS](docs/models/m5_tts.md) brings preset voices, voice cloning, and streaming; [VoxMel-TTS](docs/models/voxmel_tts.md) adds speech generation and cloning; [ROSVOT](docs/models/rosvot.md) transcribes singing notes; and [Granite Speech 5.0](docs/models/granite_speech5.md) adds multilingual ASR.
 >
-> **Shared execution improvements:** Reusable DiT and device-denoising runtimes keep sampling on the backend, with explicitly enabled CUDA/Vulkan pointwise fusions. MoE models share expert storage and offloading, including experimental hybrid CPU/GPU expert execution. HeartMuLa memory improvements and OmniVoice native batching further improve existing model paths.
+> **Performance and memory:** Faster Kokoro CPU and PocketTTS inference (and other models). The standalone [MoE engine](docs/usage.md#independent-moe-policies) supports independently selected expert-placement and cache policies.
 >
-> **Intel GPU support:** The new SYCL backend runs validated speech and music models on Intel GPUs. Support varies by model; see the [validation and performance report](docs/reports/sycl_validation.md) for working models and known limitations.
+> **Broader backend coverage:** Expanded [WASM + WebGPU validation](docs/reports/webgpu_browser_validation.md), with new pooling, transposed-convolution, and BF16 matrix-multiplication support. Linux and Windows HIP builds gain rocBLAS compatibility packages.
 >
-
+> **Controls and fixes:** CLI YAML configuration, ACE-Step reference-audio conditioning, Japanese/Korean Qwen3 alignment improvements, opt-in chunk-overlap text trimming, and custom Kokoro phoneme rules.
+>
 
 audio.cpp is built for real end-to-end execution rather than one-off model demos. Its optimized, reusable building blocks support speech generation and recognition, separation, alignment, and multi-model workflows. Shared components make new models easier to integrate and let improvements benefit multiple model families while keeping inference efficient, maintainable, and portable.
 
 ## Features
 
-⭐ **148 audio model families and 250+ variants.** Run TTS, ASR, music generation, voice cloning, conversion, separation, and more locally through a shared CLI and server API.
+⭐ **154 audio model families and 250+ variants.** Run TTS, ASR, music generation, voice cloning, conversion, separation, and more locally through a shared CLI and server API.
 
 ⭐ **Built-in WebUI.** Generate and clone voices in Studio, compare models in Arena, manage models and voice libraries, and assemble narration with reusable speakers and passage editing in the TTS app.
 
@@ -50,9 +51,11 @@ audio.cpp would not be moving this quickly without generous contributors bringin
 ## News
 
 > [!IMPORTANT]
-> **v0.9.5:** New Zonos2/3, Kroko XL, Edda ASR, MOSS-SoundEffect v2, and MuLaCover models; MossFormer2 enhancement and super-resolution; SYCL backend support; shared DiT and MoE execution; and WebUI, model-management, and memory improvements. Thanks to everyone contributing model ports, optimizations, fixes, and validation!
+> **2026-11-21 — Release v0.9.6:** New SoulX-Singer, Tiny Voca, Inworld Voice Isolator, M5-TTS, VoxMel-TTS, ROSVOT, and Granite Speech 5.0 models. This release expands browser WebGPU coverage, improves CPU inference and streaming reuse, reduces metadata memory reservations, and introduces a standalone MoE engine with independent placement and cache policies. CLI YAML configuration and new conditioning and frontend controls round out the release. Thanks to our contributors for the ports, optimizations, fixes, and backend validation!
 
-**2026-11-04 — Release v0.9.4:** **WebGPU support brings audio inference to the browser with WASM**, and the WebUI gains **streaming voice chat with animated SoulX avatars**, cross-language dubbing, and voice-library export, import, and sorting. New models include **Nemotron 3.5 Transcribe** with CPU offload below 7 GB VRAM, **LFM3-Audio, LFM D1-Omni, PocketTTS Small, SoulX-FlashHead, Real-time RE-USE, Magenta RealTime 2, Music Flamingo, Haas, and Underdog Bark 3**, plus Irodori-TTS v4 Large. Experimental AMD kernel selection, new performance controls, and backend fixes improve speed, memory use, and compatibility. This release brings together community model ports, backend optimizations, and fixes shaped by real deployment reports.
+**2026-11-14 — Release v0.9.5:** New Zonos2/3, Kroko XL, Edda ASR, MOSS-SoundEffect v2, and MuLaCover models; MossFormer2 enhancement and super-resolution; SYCL backend support; shared DiT and MoE execution; and WebUI, model-management, and memory improvements. Thanks to everyone contributing model ports, optimizations, fixes, and validation!
+
+2026-11-04 — **Release v0.9.4: WebGPU support brings audio inference to the browser with WASM**, and the WebUI gains streaming voice chat with animated SoulX avatars, cross-language dubbing, and voice-library export, import, and sorting. New models include Nemotron 3.5 Transcribe with CPU offload below 7 GB VRAM, LFM3-Audio, LFM D1-Omni, PocketTTS Small, SoulX-FlashHead, Real-time RE-USE, Magenta RealTime 2, Music Flamingo, Haas, and Underdog Bark 3, plus Irodori-TTS v4 Large. Experimental AMD kernel selection, new performance controls, and backend fixes improve speed, memory use, and compatibility. This release brings together community model ports, backend optimizations, and fixes shaped by real deployment reports.
 
 **2026-10-26 — Release v0.9.3:** New speech models including Drama3, Ming 3.0 TTS/Audio Tiny, XTTS v2, Plapre 3, Gradium Phonon, and Earshot VAD, plus experimental LatentSync lip sync. Highlights include **LoRA across 11 models**, a **TTS workspace**, voice-cloning and dubbing recipes, `perf_mode` presets, lower memory use, and expanded HIP, ARM NEON, and Rockchip NPU support. Thanks to our contributors!
 
@@ -111,6 +114,7 @@ Core and community models are grouped by task and listed alphabetically within e
 | **mira_tts** (C)<br>Mirek [@mirek190](https://github.com/mirek190) | TTS, Clone | en | [MiraTTS](docs/models/mira_tts.md) | Local conversion |
 | **moss_tts_local**<br>[@justinjohn0306](https://github.com/justinjohn0306) | TTS, Clone, Ctrl | auto, optional language hint | [MOSS-TTS-Local-Transformer-v1.5](docs/models/moss_tts_local.md) | GGUF 16/Q8 |
 | **moss_tts_nano** | TTS, Clone | auto | [MOSS-TTS-Nano-100M](docs/models/moss_tts_nano.md) | GGUF 16/Q8, Stream |
+| **m5_tts** | TTS, Clone | zh, en, de, fr, ja, ko | [M5-TTS 50M VoiceClone / CustomVoice](docs/models/m5_tts.md) | GGUF F16/Q8, Stream |
 | **moss_tts_v15** (C)<br>Chris [@christopherthompson81](https://github.com/christopherthompson81) | TTS, Clone | en, zh | [MOSS-TTS-v1.5](docs/models/moss_tts_v15.md) | GGUF |
 | **moss_ttsd** (C)<br>Chris [@christopherthompson81](https://github.com/christopherthompson81) | TTS, Clone, Dialogue | en, zh | [MOSS-TTSD](docs/models/moss_ttsd.md) | GGUF BF16/Q8/Q4 |
 | **moss_voicegen** (C)<br>Joost [@jrohde](https://github.com/jrohde) | Voice Design | en, zh | [MOSS-VoiceGenerator](docs/models/moss_voicegen.md) | GGUF |
@@ -126,11 +130,13 @@ Core and community models are grouped by task and listed alphabetically within e
 | **sanotts** (C)<br>Ashish [@voidash](https://github.com/voidash) | TTS | en, vi, id, cs, de, es, fr, it, pt, ro, ru, tr, ne, hi | [sanoTTS voice family](docs/models/sanotts.md) | GGUF FP32 |
 | **soprano_tts** (C)<br>[@drzsdrtfg](https://github.com/drzsdrtfg) | TTS | en | [Soprano 1.1 80M](docs/models/soprano_tts.md) | GGUF Q8, Stream |
 | **sopro_tts** (C)<br>[@Brioch](https://github.com/Brioch)<br>[@samuel-vitorino](https://github.com/samuel-vitorino) | TTS, Clone | en, pt, fr, de | [Sopro V2 Turbo (2.2.0)](docs/models/sopro_tts.md) | Safetensors, GGUF F16, Stream |
+| **tiny_voca** (C)<br>Nazeem [@n4ze3m](https://github.com/n4ze3m) | TTS | en | [tiny-voca](docs/models/tiny_voca.md) | GGUF FP32 |
 | **supertonic** | TTS | en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na | [Supertonic 3](docs/tts.md#supertonic) | GGUF F32, Stream |
 | **vibevoice** | TTS, Dialogue | en, zh | [VibeVoice-1.5B](docs/tts.md#vibevoice)<br>VibeVoice-7B | GGUF 16/Q8, Stream, LoRA |
 | **vieneu_v3_turbo** (C)<br>Bảo [@pnnbao97](https://github.com/pnnbao97)<br>[@phuocnguyen90](https://github.com/phuocnguyen90) | TTS, Clone | vi, en | [VieNeu-TTS v3 Turbo](docs/models/vieneu_v3_turbo.md) | GGUF |
 | **voxcpm1** (C)<br>[@jasonchen31](https://github.com/jasonchen31) | TTS, Clone | zh, en, ja, ko | [VoxCPM1](docs/models/voxcpm1.md) | GGUF Q8, Stream, LoRA |
 | **voxcpm2** | TTS, Clone, Design, Ctrl | ar, da, de, el, en, es, fi, fr, he, hi, id, it, ja, km, ko, lo, ms, my, nl, no, pl, pt, ru, sv, sw, th, tl, tr, vi, zh | [VoxCPM2-2B](docs/tts.md#voxcpm2)<br>VocalRender-Pro | GGUF 16/Q8, Stream, LoRA |
+| **voxmel_tts** | TTS, Clone | en, zh | [VoxMel 0.6B](docs/models/voxmel_tts.md) | GGUF F16/Q8 |
 | **voxtral_tts** | TTS | en, fr, es, de, it, pt, nl, ar, hi | [Voxtral-4B-TTS-2603](docs/models/voxtral_tts.md) | GGUF BF16/Q8, Stream |
 | **xtts_v2** (C)<br>[@whoreson](https://github.com/whoreson) | TTS, Clone | en, es, fr, de, it, pt, pl, tr, ru, nl, cs, ar, zh-cn, hu, ko, ja, hi | [Coqui XTTS v2](docs/community_models/xtts_v2.md) | GGUF original/Q8_0/Q4_K_M |
 | **zipvoice** (C)<br>Community | TTS, Clone | zh, en | [ZipVoice](docs/models/zipvoice.md) | GGUF F32, Stream |
@@ -156,6 +162,7 @@ Core and community models are grouped by task and listed alphabetically within e
 | **fun_asr_nano**<br>[@LauraGPT](https://github.com/LauraGPT) (FunASR team) | ASR | auto, zh, en, ja | [Fun-ASR-Nano-2512](docs/models/fun_asr_nano.md) | GGUF 16/Q8 |
 | **gigaam_asr** | ASR | ru, kk, ky, uz, en | [GigaAM v3 CTC](docs/models/gigaam_asr.md)<br>GigaAM v3 RNN-T<br>GigaAM v3 E2E CTC<br>GigaAM v3 E2E RNN-T<br>GigaAM Multilingual CTC<br>GigaAM Multilingual Large CTC | GGUF F16/F32 |
 | **granite5asr** (C)<br>[@ampersandru](https://github.com/ampersandru) | ASR | en, fr, de, es, pt, it, ja | [IBM Granite Speech 5.0 470M TurboCTC](docs/models/granite5asr.md) | GGUF Q8 |
+| **granite_speech5** (C) | ASR | en, fr, de, es, pt, ja | [IBM Granite Speech 5.0 2B](docs/models/granite_speech5.md) | Safetensors, GGUF orig/Q8 |
 | **haas_asr** (C)<br>Third Intelligence | ASR | ja | [Haas-ja-v1.0](docs/models/haas.md) | GGUF F16/Q8, Stream |
 | **higgs_audio_stt** | ASR | en | [Higgs Audio v3 STT](docs/models/higgs_audio_stt.md) | GGUF 16/Q8, Stream |
 | **hviske_asr** | ASR | da | [Hviske v5.3](docs/asr.md#hviske-asr) | GGUF Q8 |
@@ -209,10 +216,12 @@ Core and community models are grouped by task and listed alphabetically within e
 | **mel_band_roformer** | Sep | lang agnostic | [Mel-Band RoFormer](docs/audio_tools.md#mel-band-roformer) | GGUF 16/Q8 |
 | **miocodec** | Codec, VC | lang agnostic | [MioCodec v2](docs/audio_tools.md#miocodec) | GGUF 16/Q8 |
 | **mossformer2** | Sep, S2S · Enhancement / Super-resolution | lang agnostic | [MossFormer2 SS 16K / SE 48K / SR 48K](docs/models/mossformer2.md) | GGUF F32/F16 |
+| **rosvot** | MIDI | music | [ROSVOT singing transcription](docs/models/rosvot.md) | GGUF F32 |
 | **muscriptor** | MIDI | music | [MuScriptor Small/Medium/Large](docs/models/muscriptor.md) | GGUF F32, Stream |
 | **realtime_reuse** (C) | S2S · Speech enhancement | lang agnostic | [Real-time RE-USE](docs/models/realtime_reuse.md) | GGUF F32, Stream |
 | **reuse** (C) | S2S · Speech restoration | lang agnostic | [RE-USE](docs/models/reuse.md) | GGUF F32/F16/Q8_0 |
 | **rvc** | VC | lang agnostic | [RVC v1 / v2](docs/audio_tools.md#rvc) | GGUF 16 |
+| **voice_isolator** (C)<br>[@Etherll](https://github.com/Etherll) | S2S · Voice isolation | lang agnostic | [Voice Isolator v1 offline / realtime](docs/models/voice_isolator.md) | GGUF F32, Stream |
 | **sam_audio** | S2S · Sound separation | lang agnostic | [SAM Audio Small](docs/models/sam_audio.md)<br>SAM Audio Base<br>SAM Audio Large | GGUF F32/BF16/Q8 |
 | **seed_vc** | VC | lang agnostic | [SeedVC XLS-R + HiFT](docs/models/seed_vc.md)<br>SeedVC Whisper-small + BigVGAN | GGUF 16/Q8 |
 | **sheetsage2** | MIDI | music | [SheetSage2](docs/audio_tools.md#sheetsage2) | GGUF orig |
@@ -236,6 +245,7 @@ Core and community models are grouped by task and listed alphabetically within e
 | **moss_soundeffect** | SFX | en, zh | [MOSS-SoundEffect v2](docs/models/moss_soundeffect.md) | GGUF BF16/Q8 |
 | **mulacover** | Music | multilingual | [MuLaCover](docs/models/mulacover.md) | GGUF 16/Q8 |
 | **soulx_flashhead** | Audio-to-video | lang agnostic | [SoulX-FlashHead Lite](docs/models/soulx_flashhead.md) | GGUF Q8/BF16, Stream |
+| **soulx_singer** | Singing synthesis / voice conversion | zh, en, yue; SVC lang agnostic | [SoulX-Singer SVS/SVC](docs/models/soulx_singer.md) | GGUF F16/Q8 |
 | **stable_audio** | Music, SFX, Edit | en | [Stable Audio 3 Small Music](docs/models/stable_audio.md)<br>Stable Audio 3 Small SFX<br>Stable Audio 3 Medium | GGUF 16/Q8 |
 | **vevo2** | TTS, Music, VC, Edit | en, zh | [Vevo2](docs/models/vevo2.md) | GGUF 16 |
 | **yue2** | Music | en | [YuE2-3B](docs/models/yue2.md) | GGUF BF16/Q8/Q4, LoRA |
@@ -706,6 +716,28 @@ Common interface options:
 - `--device <n>` selects the backend device
 - `--threads <n>` sets backend and OpenMP worker threads
 
+CLI options can also be loaded from a YAML file with `--config-file`. Use the option name
+without its leading dashes; scalar values map to one option, sequences repeat an option, and
+boolean values enable/disable valueless flags. For scalar options supplied in both places, the
+command-line value takes precedence:
+
+```yaml
+task: tts
+family: pocket_tts
+model: /path/to/model
+backend: cuda
+text: "Hello from YAML"
+voice-id: alba
+request-option:
+  - temperature=0.7
+metrics: true
+do-sample: false
+```
+
+```bash
+build/bin/audiocpp_cli --config-file run.yaml --text "CLI text overrides YAML"
+```
+
 Examples:
 
 Text-to-speech:
@@ -939,6 +971,7 @@ Have a project using audio.cpp? Submit a PR or let me know, and I’ll be happy 
 - [OpenDub](https://github.com/estebanstifli/OpenDub) is an open-source desktop video dubbing studio for Windows, Linux, and macOS. It uses audio.cpp for dialogue separation, transcription, alignment, speaker diarization, and IndexTTS2.5 speech generation, with editable segments, voice and emotion references, synchronized playback, and video/audio export.
 - [pyVideoTrans](https://github.com/jianchang512/pyvideotrans): A one-stop video translation and dubbing tool that integrates audio.cpp as one of its built-in dubbing options.
 - [LocalText2Voice](https://github.com/estebanstifli/LocalText2Voice) is a free, open-source desktop app for long-form audiobooks, podcasts and narrated videos. Features include multi-voice scripts, voice cloning and design, emotion controls, segment editing and regeneration, optional Whisper verification, M4B/MP3 export, subtitles, music mixing, a Video Storyboard beta and MCP automation.
+- [Woogles-TV](https://github.com/jgbrwn/woogles-tv) is an open-source (AGPL) crossword board game for the living room: the board shows on a TV (Android TV, Chromecast or any browser) while each player's tiles stay private on their phone. It runs audio.cpp's server with Pocket TTS in Docker as an optional announcer voice, streaming moves, scores and word definitions to the TV with a choice of 15 voices.
 
 For supported precisions, memory-saving options and performance presets, see each model’s usage guide and the [GGUF guide](docs/gguf.md).
 
